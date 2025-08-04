@@ -10,7 +10,7 @@ dependencies=[
   "torchaudio",
   "zarr==3.1.0",
   "numpy==1.26",
-  "marimo>=0.14.12",
+  "marimo",
   "einops>=0.8.1",
   "pandas>=2.3.1",
   "fastparquet>=2024.11.0",
