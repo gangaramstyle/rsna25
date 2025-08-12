@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.14.12"
+__generated_with = "0.14.16"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -19,72 +19,100 @@ with app.setup:
 
 @app.cell
 def _():
-    metadata = pd.read_parquet('/cbica/home/gangarav/data_25_processed/metadata.parquet')
+    stats_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/zarr_stats.parquet')
+    og_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/metadata.parquet')
+    merged_df = pd.merge(
+        og_pd,
+        stats_pd,
+        on='zarr_path',
+        how='left'
+    )
+    metadata = merged_df
     table = mo.ui.table(metadata, selection='single')
     table
     return (table,)
 
 
 @app.cell
-def _(scan):
-    q = scan.get_scan_array_copy().flatten()
+def _(table):
+    metadata_row = table.value
+    return (metadata_row,)
 
-    # Remove top 5 most frequent values
-    unique, counts = np.unique(q, return_counts=True)
-    top_5_indices = np.argsort(counts)[-5:][::-1]
-    top_5_values = unique[top_5_indices]
 
-    # Create mask to exclude top 5 values
-    mask = ~np.isin(q, top_5_values)
-    q_filtered = q[mask]
+@app.cell
+def _(metadata_row):
+    wc = metadata_row["median"].values[0]
+    ww = 6*metadata_row["stdev"].values[0]
+    # Create randomize button
+    def randomize_wc(val):
+        return random.uniform(
+            metadata_row["median"].values[0] - metadata_row["stdev"].values[0], 
+            metadata_row["median"].values[0] + metadata_row["stdev"].values[0]
+        )
 
-    # Create histogram of remaining pixel values
-    plt.figure(figsize=(10, 6))
-    plt.hist(q_filtered, bins=100, alpha=0.7, color='steelblue', edgecolor='black', range=(-32768, 32767))
-    median_val = np.median(q_filtered)
-    plt.axvline(median_val, color='crimson', linestyle='--', linewidth=2, label=f'Median (excl. top 5): {median_val:.1f}')
+    def randomize_ww(val):
+        return random.uniform(
+            metadata_row["stdev"].values[0], 
+            6*metadata_row["stdev"].values[0]
+        )
 
-    plt.title('Histogram of Pixel Values in Scan (Excluding Top 5 Most Frequent)')
-    plt.xlabel('Pixel Value')
-    plt.ylabel('Frequency')
-    plt.xlim(-32768, 32767)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.gca()
+    randomize_wc = mo.ui.button(
+        label="Randomize Window Center",
+        on_click=randomize_wc,
+        value=metadata_row["median"].values[0]
+    )
 
+    randomize_ww = mo.ui.button(
+        label="Randomize Window Width",
+        on_click=randomize_ww,
+        value=6*metadata_row["stdev"].values[0]
+    )
+
+    mo.vstack([
+        mo.hstack([randomize_wc, mo.md(text=f"Original window center: {wc:.0f}")], justify="start"),
+        mo.hstack([randomize_ww, mo.md(text=f"Original window width: {ww:.0f}")], justify="start"),
+    ])
+    return randomize_wc, randomize_ww
+
+
+@app.cell
+def _(randomize_wc, randomize_ww):
+    # Create text input fields for min and max values
+    wc_textbox = mo.ui.text(
+        label="Window Center",
+        value=f"{randomize_wc.value:.1f}",
+        kind="text"
+    )
+
+    ww_textbox = mo.ui.text(
+        label="Window Width", 
+        value=f"{randomize_ww.value:.1f}",
+        kind="text"
+    )
+
+
+    # Display the textboxes and button
+    mo.vstack([
+        mo.md("### Set clipping values for scan visualization"),
+        wc_textbox,
+        ww_textbox,
+    ])
     return
 
 
 @app.cell
-def _():
-    # Create text input fields for min and max values
-    min_textbox = mo.ui.text(
-        label="Min value for clipping",
-        value="1000",
-        kind="text"
-    )
-
-    max_textbox = mo.ui.text(
-        label="Max value for clipping", 
-        value="1100",
-        kind="text"
-    )
-
-    # Display the textboxes
-    mo.vstack([
-        mo.md("### Set clipping values for scan visualization"),
-        min_textbox,
-        max_textbox
-    ])
-
-    return max_textbox, min_textbox
+def _(metadata_row):
+    def normalize_hu_to_range(hu_array, w_min, w_max, out_range=(-1.0, 1.0)):
+        clipped_array = np.clip(hu_array, w_min, w_max)
+        scaled_01 = (clipped_array - w_min) / (w_max - w_min)
+        out_min, out_max = out_range
+        return scaled_01 * (out_max - out_min) + out_min
 
 
-@app.cell
-def _(max_textbox, min_textbox, table):
-    metadata_row = table.value
     zarr_name = metadata_row["zarr_path"].values[0]
     scan = zarr_scan(path_to_scan=zarr_name)
+    r_wc, r_ww = scan.get_random_wc_ww_for_scan_median_stdev(metadata_row["median"].values[0], metadata_row["stdev"].values[0])
+
     subset_1_start, subset_1_shape = scan.get_random_subset_from_scan()
     idxs_1 = scan.get_random_patch_indices_from_scan_subset(subset_1_start, subset_1_shape, 50)
     patches_1 = scan.get_patches_from_indices(idxs_1)
@@ -102,7 +130,7 @@ def _(max_textbox, min_textbox, table):
     subset_2_center_pt_space = scan.convert_indices_to_patient_space(subset_2_center)
 
 
-    scan_pixels = np.clip(scan.get_scan_array_copy(), int(min_textbox.value), int(max_textbox.value))
+    scan_pixels = normalize_hu_to_range(scan.get_scan_array_copy(), r_wc - 0.5*r_ww, r_wc + 0.5*r_ww)
     scan_pixels = scan.create_rgb_scan_with_boxes(
         scan_pixels,
         [subset_1_start],
@@ -129,7 +157,7 @@ def _(max_textbox, min_textbox, table):
     )
 
     slider = mo.ui.slider(start=0, stop=scan_pixels.shape[0]-1,value=int(scan_pixels.shape[0]/2))
-    return scan, scan_pixels, slider
+    return scan_pixels, slider
 
 
 @app.cell
@@ -145,7 +173,8 @@ def _(scan_pixels, slider):
 
 
 @app.cell
-def _():
+def _(scan_pixels):
+    scan_pixels.max(), scan_pixels.min()
     return
 
 
@@ -203,7 +232,9 @@ class zarr_scan():
 
         return rgb_volume
 
-
+    def get_random_wc_ww_for_scan_median_stdev(self, med, std):
+        return random.uniform(med-std, med+std), random.uniform(std, 6*std)
+        
     def get_random_subset_from_scan(self, min_subset_shape=(4,32,32), max_subset_shape=None, percent_outer_to_ignore=(0.0, 0.2, 0.2)):
         array_shape = self.zarr_store['pixel_data'].shape
         depth, cols, rows = array_shape
@@ -215,9 +246,6 @@ class zarr_scan():
             max_subset_shape = tuple(dim // 4 for dim in array_shape)
 
         # Ensure min/max subset shapes are valid
-        print(min_subset_shape)
-        print(self.patch_shape)
-        print(max_subset_shape)
         if not all(min_subset_shape[i] >= self.patch_shape[i] for i in range(3)):
             raise ValueError("min_subset_shape must be >= patch_shape in all dimensions.")
         if not all(max_subset_shape[i] >= min_subset_shape[i] for i in range(3)):

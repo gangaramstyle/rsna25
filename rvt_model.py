@@ -171,7 +171,7 @@ class Transformer(nn.Module):
         self.layers = nn.ModuleList([])
 
         # TODO: Are we ok with max_freq of 50? What does this correspond to in cm?
-        self.pos_emb = CoordinateRotaryEmbedding3D(dim_head, max_freq = 50)
+        self.pos_emb = CoordinateRotaryEmbedding3D(dim_head, max_freq = 250)
 
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
