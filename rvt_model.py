@@ -106,72 +106,13 @@ with app.setup:
 
 
 @app.class_definition
-class CoordinateRotaryEmbedding3D(nn.Module):
-    """
-    Generates 3D rotary embeddings from explicit, pre-normalized (y, x, z) coordinates.
-    """
-    def __init__(self, dim, max_freq=50):
-        super().__init__()
-        # The rotary dimension must be divisible by 6
-        # (3 for the axes, 2 for the pairing in rotate_every_two)
-        assert dim % 6 == 0, 'Rotary dimension `dim` must be divisible by 6 for 3D RoPE.'
-        self.dim = dim
-        self.max_freq = max_freq
-
-        # Each axis (y, x, z) gets one-third of the rotary dimensions.
-        dim_per_axis = self.dim // 3
-
-        # The number of unique frequencies is half of that.
-        scales = torch.linspace(1., max_freq / 2, dim_per_axis // 2)
-        self.register_buffer('scales', scales)
-
-    @autocast('cuda', enabled = False)
-    def forward(self, coordinates):
-        """
-        Args:
-            coordinates (Tensor): A tensor of shape (b, n, 3) with pre-normalized,
-                                  floating-point (y, x, z) coordinates.
-        """
-        b, n, _ = coordinates.shape
-        device, dtype = coordinates.device, self.scales.dtype
-
-        # TODO: assert max an min values are within a certain range
-
-        # Separate y, x, and z coordinates
-        y_coords, x_coords, z_coords = coordinates.unbind(-1)
-
-        # Reshape for broadcasting with scales
-        y_norm = rearrange(y_coords, 'b n -> b n 1')
-        x_norm = rearrange(x_coords, 'b n -> b n 1')
-        z_norm = rearrange(z_coords, 'b n -> b n 1')
-
-        # Calculate frequencies for each axis
-        scales_dev = self.scales.to(device)
-        y_freqs = y_norm * scales_dev * pi
-        x_freqs = x_norm * scales_dev * pi
-        z_freqs = z_norm * scales_dev * pi
-
-        # Concatenate frequencies for y, x, and z.
-        # Each part has shape (b, n, dim // 6). Concatenated shape: (b, n, dim // 2)
-        all_freqs_sin = torch.cat((y_freqs.sin(), x_freqs.sin(), z_freqs.sin()), dim=-1)
-        all_freqs_cos = torch.cat((y_freqs.cos(), x_freqs.cos(), z_freqs.cos()), dim=-1)
-
-        # Reshape for the attention mechanism by interleaving.
-        # (b, n, d/2) -> (b, n, d)
-        sin, cos = map(lambda t: repeat(t, 'b n d -> b n (d j)', j=2), (all_freqs_sin, all_freqs_cos))
-
-        # We need to cast back to the original input's dtype if it was e.g. float16
-        return sin.to(coordinates.dtype), cos.to(coordinates.dtype)
-
-
-@app.class_definition
 class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0., use_rotary = True, use_glu = True):
         super().__init__()
         self.layers = nn.ModuleList([])
 
         # TODO: Are we ok with max_freq of 50? What does this correspond to in cm?
-        self.pos_emb = CoordinateRotaryEmbedding3D(dim_head, max_freq = 250)
+        self.pos_emb = PosEmbedding3D(dim_head, max_freq = 3)
 
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
@@ -231,6 +172,84 @@ class RvT(nn.Module):
         x = self.transformer(x, coords, n_non_input_tokens=2+self.register_count)
 
         return x
+
+
+@app.class_definition
+class PosEmbedding3D(nn.Module):
+    """
+    Generates 3D rotary embeddings from explicit, pre-normalized (y, x, z) coordinates.
+    """
+    def __init__(self, dim, max_freq=50):
+        super().__init__()
+
+        assert dim % 6 == 0, 'Rotary dimension `dim` must be divisible by 6 for 3D RoPE.'
+        self.dim = dim
+        self.max_freq = max_freq
+
+        # Each axis (y, x, z) gets one-third of the rotary dimensions.
+        dim_per_axis = self.dim // 3
+
+        # The number of unique frequencies is half of that.
+        scales = torch.linspace(1., max_freq / 2, dim_per_axis // 2)
+        self.register_buffer('scales', scales)
+
+    def forward(self, coordinates):
+        """
+        Args:
+            coordinates (Tensor): A tensor of shape (b, n, 3) with pre-normalized,
+                                  floating-point (y, x, z) coordinates.
+        """
+        b, n, _ = coordinates.shape
+        device, dtype = coordinates.device, self.scales.dtype
+
+        # TODO: assert max an min values are within a certain range
+
+        # Separate y, x, and z coordinates
+        y_coords, x_coords, z_coords = coordinates.unbind(-1)
+
+        # Reshape for broadcasting with scales
+        y_norm = rearrange(y_coords, 'b n -> b n 1')
+        x_norm = rearrange(x_coords, 'b n -> b n 1')
+        z_norm = rearrange(z_coords, 'b n -> b n 1')
+
+        # Calculate frequencies for each axis
+        scales_dev = self.scales.to(device)
+        y_freqs = y_norm * scales_dev * pi
+        x_freqs = x_norm * scales_dev * pi
+        z_freqs = z_norm * scales_dev * pi
+
+        # Concatenate frequencies for y, x, and z.
+        # Each part has shape (b, n, dim // 6). Concatenated shape: (b, n, dim // 2)
+        all_freqs_sin = torch.cat((y_freqs.sin(), x_freqs.sin(), z_freqs.sin()), dim=-1)
+        all_freqs_cos = torch.cat((y_freqs.cos(), x_freqs.cos(), z_freqs.cos()), dim=-1)
+
+        # Reshape for the attention mechanism by interleaving.
+        # (b, n, d/2) -> (b, n, d)
+        sin, cos = map(lambda t: repeat(t, 'b n d -> b n (d j)', j=2), (all_freqs_sin, all_freqs_cos))
+
+        # We need to cast back to the original input's dtype if it was e.g. float16
+        return sin.to(coordinates.dtype), cos.to(coordinates.dtype)
+
+    @staticmethod
+    def interleave_two_tensors(t1: torch.Tensor, t2: torch.Tensor) -> torch.Tensor:
+        """
+        Interleaves two tensors along their last dimension.
+        Example: [a, b, c] and [x, y, z] -> [a, x, b, y, c, z]
+        """
+        if t1.shape != t2.shape:
+            raise ValueError("Input tensors must have the same shape.")
+
+        b, n, d = t1.shape
+
+        # 1. Stack the tensors to create a new last dimension: (b, n, d, 2)
+        stacked = torch.stack((t1, t2), dim=-1)
+
+        # 2. Reshape to merge the last two dimensions: (b, n, d * 2)
+        #    This works because reshape reads from memory contiguously.
+        #    The memory layout of stacked is [t1_d1, t2_d1, t1_d2, t2_d2, ...]
+        interleaved = stacked.reshape(b, n, d * 2)
+
+        return interleaved
 
 
 @app.cell
