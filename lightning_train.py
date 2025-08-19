@@ -17,7 +17,7 @@ def _():
     from torchvision.transforms import ToTensor
     import lightning as L
     from pytorch_lightning.loggers import WandbLogger
-    from pytorch_lightning.callbacks import ModelCheckpoint
+    from lightning.pytorch.callbacks import ModelCheckpoint
     from rvt_model import RvT, PosEmbedding3D
     from torch.utils.data import DataLoader, IterableDataset
     from typing import Optional, Tuple, Dict, Any
@@ -25,6 +25,7 @@ def _():
     import pandas as pd
     import numpy as np
     import random
+    import time
 
     # define the LightningModule
     class RadiographyEncoder(L.LightningModule):
@@ -54,6 +55,7 @@ def _():
             self.n_registers=n_registers
 
             super().__init__()
+        
             self.save_hyperparameters()
             self.encoder = RvT(
                 patch_size=patch_size,
@@ -106,9 +108,7 @@ def _():
             view_prediction = self.relative_view_head(fused_view_cls)
             loss = self.view_criterion(view_prediction, view_target)
 
-            print(loss)
-
-            self.log("view_loss", loss)
+            self.log("view_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
             return loss
 
         # def validation_step(self, batch, batch_idx):
@@ -121,8 +121,8 @@ def _():
         #     self.log("val_loss", val_loss)
 
         def configure_optimizers(self):
-            optimizer = optim.Adam(self.parameters(), lr=1e-4)
-            return optimizer
+            # Use the learning_rate from hparams so it can be configured by sweeps
+            optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
 
 
     encoder = RadiographyEncoder(
@@ -153,6 +153,7 @@ def _():
         random,
         shutil,
         sys,
+        time,
         torch,
         zarr_scan,
     )
@@ -179,7 +180,7 @@ def _(
 ):
     class PrismOrderingDataset(IterableDataset):
 
-        def __init__(self, metadata, patch_shape, n_patches, n_sampled_from_same_study=128, scratch_dir="/scratch/gangarav/"):
+        def __init__(self, metadata, patch_shape, n_patches, n_sampled_from_same_study=64, scratch_dir="/scratch/gangarav/"):
             super().__init__()
             stats_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/zarr_stats.parquet')
             og_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/metadata.parquet')
@@ -189,7 +190,7 @@ def _(
                 on='zarr_path',
                 how='left'
             )
-            self.metadata = merged_df.head(4)
+            self.metadata = merged_df
 
             self.patch_shape = patch_shape
             self.n_patches = n_patches
@@ -331,7 +332,7 @@ def _(
         scratch_dir=sys.argv[1]
     )
 
-    NUM_WORKERS=8
+    NUM_WORKERS=12
     dataloader = DataLoader(
         dataset,
         batch_size=128,
@@ -344,18 +345,25 @@ def _(
 
 
 @app.cell
+def _():
+    return
+
+
+@app.cell
 def _(L, ModelCheckpoint, WandbLogger, dataloader, encoder):
     wandb_logger = WandbLogger(project="rsna25-prism-ordering")
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=f'checkpoints/{wandb_logger.version}', # Save in a run-specific folder
-        filename='best_model', # Always name the file 'best_model.ckpt'
+        filename='best_model_all', # Always name the file 'best_model.ckpt'
         save_top_k=1,          # Only save the single best checkpoint
         monitor='view_loss',   # Metric to monitor
-        mode='min'             # 'min' because lower loss is better
+        mode='min',            # 'min' because lower loss is better
+        every_n_train_steps=5000,
+        save_on_train_epoch_end=False
     )
 
-    trainer = L.Trainer(limit_train_batches=100000, max_epochs=1000, logger=wandb_logger, log_every_n_steps=25)
+    trainer = L.Trainer(limit_train_batches=100000, max_epochs=1000, callbacks=[checkpoint_callback], logger=wandb_logger, log_every_n_steps=25)
     trainer.fit(model=encoder, train_dataloaders=dataloader) #, val_dataloaders=) #
     return
 
