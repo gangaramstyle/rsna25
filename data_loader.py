@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.14.16"
+__generated_with = "0.14.17"
 app = marimo.App(width="columns")
 
 with app.setup:
@@ -139,10 +139,11 @@ class zarr_scan():
 
         patches_1 = sample_1_data['normalized_patches']
         patches_2 = sample_2_data['normalized_patches']
-        patch_coords_1 = sample_1_data['patch_centers_idx'] - sample_1_data['subset_center_idx']
-        patch_coords_2 = sample_2_data['patch_centers_idx'] - sample_2_data['subset_center_idx']
+        patch_coords_1 = sample_1_data['patch_centers_pt'] - sample_1_data['subset_center_pt']
+        patch_coords_2 = sample_2_data['patch_centers_pt'] - sample_2_data['subset_center_pt']
 
-        label = sample_2_data['subset_center_idx'] - sample_1_data['subset_center_idx']
+        label = sample_2_data['subset_center_pt'] - sample_1_data['subset_center_pt']
+        label = label.squeeze(0)
 
         if to_torch:
             patches_1 = torch.from_numpy(patches_1).to(torch.float32)
@@ -151,7 +152,7 @@ class zarr_scan():
             patch_coords_2 = torch.from_numpy(patch_coords_2).to(torch.float32)
             label = torch.from_numpy(label).to(torch.float32)
 
-        return patches_1, patches_2, patch_coords_1, patch_coords_2, label, sample_1_data, sample_2_data
+        return patches_1, patches_2, patch_coords_1, patch_coords_2, label
 
     def train_sample(
         self,
@@ -488,20 +489,37 @@ class zarr_scan():
         n_patches = patch_indices.shape[0]
         patch_d, patch_r, patch_c = self.patch_shape
 
-        # Use advanced indexing with broadcasting for efficiency
-        # Create indexers for each dimension
-        d_idx = patch_indices[:, 0, np.newaxis] + np.arange(patch_d)
-        r_idx = patch_indices[:, 1, np.newaxis] + np.arange(patch_r)
-        c_idx = patch_indices[:, 2, np.newaxis] + np.arange(patch_c)
+        # --- Step 1: Calculate the bounding box for all patches ---
+        # Find the top-left-front corner of the entire region
+        min_coords = np.min(patch_indices, axis=0)
 
-        # The zarr array needs to be indexed carefully to avoid loading huge chunks
-        # This approach fetches each patch individually.
-        # For Zarr, it's often better to iterate if patches are far apart.
-        # However, for a small number of patches, this is fine.
-        patches = np.array([
-            self.zarr_store['pixel_data'][d:d+patch_d, r:r+patch_r, c:c+patch_c]
-            for d, r, c in patch_indices
-        ])
+        # Find the bottom-right-back corner of the entire region
+        # We need the start of the last patch + its size
+        max_coords = np.max(patch_indices, axis=0)
+        end_coords = max_coords + np.array([patch_d, patch_r, patch_c])
+
+        min_d, min_r, min_c = min_coords
+        end_d, end_r, end_c = end_coords
+
+        # --- Step 2: Make ONE large read from the Zarr store ---
+        # This reads the entire bounding box into a single NumPy array in memory.
+        # This is the ONLY interaction with the Zarr store.
+        super_patch = self.zarr_store['pixel_data'][min_d:end_d, min_r:end_r, min_c:end_c]
+
+        # --- Step 3: Extract individual patches from the in-memory super_patch ---
+        # Pre-allocate the final array for efficiency
+        patches = np.empty((n_patches, patch_d, patch_r, patch_c), dtype=super_patch.dtype)
+
+        for i, (d, r, c) in enumerate(patch_indices):
+            # Calculate the patch's position *relative* to the super_patch's origin
+            d_rel, r_rel, c_rel = d - min_d, r - min_r, c - min_c
+
+            # Slice the patch from the in-memory NumPy array (this is extremely fast)
+            patches[i] = super_patch[
+                d_rel : d_rel + patch_d,
+                r_rel : r_rel + patch_r,
+                c_rel : c_rel + patch_c
+            ]
 
         return patches
 
@@ -526,7 +544,7 @@ class zarr_scan():
             homogeneous_coords[:, :, np.newaxis]
         ).squeeze(axis=2)
 
-        return patient_coords
+        return patient_coords[:,:-1]
 
 
 @app.cell
