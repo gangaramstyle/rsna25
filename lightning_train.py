@@ -41,11 +41,11 @@ def _():
             # training runtime hyperparameters
             batch_size,
             learning_rate,
-            training_steps,
             # dataset hyperparameters
             patch_size,
             patch_jitter,
             # objectives
+            view_objective_mode
         ):
             #view objectives refer to:
             #  x, y, z axes
@@ -55,7 +55,7 @@ def _():
             self.n_registers=n_registers
 
             super().__init__()
-        
+
             self.save_hyperparameters()
             self.encoder = RvT(
                 patch_size=patch_size,
@@ -75,7 +75,10 @@ def _():
                 nn.Linear(encoder_dim * 2, NUM_VIEW_OBJECTIVES)
             )
 
-            self.view_criterion = nn.BCEWithLogitsLoss() 
+            if self.hparams.view_objective_mode == 'classification':
+                self.view_criterion = nn.BCEWithLogitsLoss()
+            elif self.hparams.view_objective_mode == 'regression':
+                self.view_criterion = nn.MSELoss()
 
         def raw_encoder_emb_to_scan_view_registers_patches(self, emb):
             # 0: global scan embedding
@@ -91,7 +94,11 @@ def _():
             # TODO: allow swapping view target between
             # - regression versus classification task
             # - patient space versus pixel space
-            view_target = (label > 0).to(torch.float32)
+            if self.hparams.view_objective_mode == 'classification':
+                view_target = (label > 0).to(torch.float32)
+            elif self.hparams.view_objective_mode == 'regression':
+                # Target is the actual distance value
+                view_target = (label/100).to(torch.float32)
 
             # TODO: allow swapping between
             # - absolute versus relative position embedding
@@ -108,7 +115,7 @@ def _():
             view_prediction = self.relative_view_head(fused_view_cls)
             loss = self.view_criterion(view_prediction, view_target)
 
-            self.log("view_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            self.log("view_loss", loss)
             return loss
 
         # def validation_step(self, batch, batch_idx):
@@ -123,38 +130,39 @@ def _():
         def configure_optimizers(self):
             # Use the learning_rate from hparams so it can be configured by sweeps
             optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+            return optimizer
 
 
-    encoder = RadiographyEncoder(
-        encoder_dim=288,
-        encoder_depth=12,
-        encoder_heads=12,
-        mlp_dim=512,
-        n_registers=8,
-        use_rotary=True,
-        # training runtime hyperparameters
-        batch_size=128,
-        learning_rate=1e-4,
-        training_steps=5,
-        # dataset hyperparameters
-        patch_size=(1, 16, 16),
-        patch_jitter=1.0,
-    )
+    # encoder = RadiographyEncoder(
+    #     encoder_dim=288,
+    #     encoder_depth=12,
+    #     encoder_heads=12,
+    #     mlp_dim=512,
+    #     n_registers=8,
+    #     use_rotary=True,
+    #     # training runtime hyperparameters
+    #     batch_size=128,
+    #     learning_rate=1e-4,
+    #     training_steps=5,
+    #     # dataset hyperparameters
+    #     patch_size=(1, 16, 16),
+    #     patch_jitter=1.0,
+    # )
     return (
         DataLoader,
         IterableDataset,
         L,
         ModelCheckpoint,
+        RadiographyEncoder,
         WandbLogger,
-        encoder,
         np,
         os,
         pd,
         random,
         shutil,
-        sys,
         time,
         torch,
+        wandb,
         zarr_scan,
     )
 
@@ -165,19 +173,7 @@ def _():
 
 
 @app.cell
-def _(
-    DataLoader,
-    IterableDataset,
-    np,
-    os,
-    pd,
-    random,
-    shutil,
-    sys,
-    time,
-    torch,
-    zarr_scan,
-):
+def _(IterableDataset, np, os, pd, random, shutil, time, torch, zarr_scan):
     class PrismOrderingDataset(IterableDataset):
 
         def __init__(self, metadata, patch_shape, n_patches, n_sampled_from_same_study=64, scratch_dir="/scratch/gangarav/"):
@@ -190,7 +186,7 @@ def _(
                 on='zarr_path',
                 how='left'
             )
-            self.metadata = merged_df
+            self.metadata = merged_df.head(24)
 
             self.patch_shape = patch_shape
             self.n_patches = n_patches
@@ -317,59 +313,179 @@ def _(
 
                         yield patches_1, patches_2, coords_1, coords_2, row_id, label
 
-    # --- Configuration ---
-    METADATA_PATH = '/cbica/home/gangarav/data_25_processed/zarr_stats.parquet'
+    # # --- Configuration ---
+    # METADATA_PATH = '/cbica/home/gangarav/data_25_processed/zarr_stats.parquet'
 
-    # Data parameters (MUST match between dataset and model)
-    PATCH_SHAPE = (1, 16, 16) # (Depth, Height, Width) of each patch
-    N_PATCHES = 64            # Number of patches to sample from each scan
+    # # Data parameters (MUST match between dataset and model)
+    # PATCH_SHAPE = (1, 16, 16) # (Depth, Height, Width) of each patch
+    # N_PATCHES = 64            # Number of patches to sample from each scan
 
-    # setup data
-    dataset = PrismOrderingDataset(
-        metadata=METADATA_PATH,
-        patch_shape=PATCH_SHAPE,
-        n_patches=N_PATCHES,
-        scratch_dir=sys.argv[1]
-    )
+    # # setup data
+    # dataset = PrismOrderingDataset(
+    #     metadata=METADATA_PATH,
+    #     patch_shape=PATCH_SHAPE,
+    #     n_patches=N_PATCHES,
+    #     scratch_dir=sys.argv[1]
+    # )
 
-    NUM_WORKERS=12
-    dataloader = DataLoader(
-        dataset,
-        batch_size=128,
-        num_workers=NUM_WORKERS, # Use 2 worker processes to load data in parallel
-        persistent_workers=(NUM_WORKERS > 0),
-        pin_memory=True,
-    )
-    # include a validation set
-    return (dataloader,)
+    # NUM_WORKERS=12
+    # dataloader = DataLoader(
+    #     dataset,
+    #     batch_size=128,
+    #     num_workers=NUM_WORKERS, # Use 2 worker processes to load data in parallel
+    #     persistent_workers=(NUM_WORKERS > 0),
+    #     pin_memory=True,
+    # )
+    # # include a validation set
+    return (PrismOrderingDataset,)
+
+
+@app.cell
+def _(
+    DataLoader,
+    L,
+    ModelCheckpoint,
+    PrismOrderingDataset,
+    RadiographyEncoder,
+    WandbLogger,
+    os,
+    wandb,
+):
+    def train_run(default_config=None):
+        """
+        Main training function that can be called by a sweep agent or for a single run.
+        Handles both starting new runs and resuming existing ones.
+        """
+        # --- 1. Initialize Weights & Biases ---
+        # `wandb.init()` will automatically pick up hyperparameters from a sweep agent.
+        # If resuming, it will use the WANDB_RUN_ID environment variable.
+        # The `resume="allow"` option is key to enabling this behavior.
+        run = wandb.init(config=default_config, resume="allow")
+        print(run)
+        checkpoint_dir = f'/cbica/home/gangarav/checkpoints/{run.id}'
+
+        # Pull the final config from wandb. This includes sweep params and defaults.
+        cfg = wandb.config
+
+        # --- 2. Handle Resuming ---
+        ckpt_path = None
+        if run.resumed:
+            print(f"Resuming run {run.id}...")
+            # Check for the 'last.ckpt' created by lightning's ModelCheckpoint.
+            potential_ckpt = os.path.join(checkpoint_dir, 'last.ckpt')
+            if os.path.exists(potential_ckpt):
+                ckpt_path = potential_ckpt
+                print(f"Found checkpoint to resume from: {ckpt_path}")
+            else:
+                print(f"WARNING: Run {run.id} is being resumed, but no 'last.ckpt' found in {checkpoint_dir}. Starting training from scratch but logging to the same run.")
+
+        # --- 3. Setup Model ---
+        model = RadiographyEncoder(
+            encoder_dim=cfg.encoder_dim,
+            encoder_depth=cfg.encoder_depth,
+            encoder_heads=cfg.encoder_heads,
+            mlp_dim=cfg.mlp_dim,
+            n_registers=cfg.n_registers,
+            use_rotary=True,
+            batch_size=cfg.batch_size,
+            learning_rate=cfg.learning_rate,
+            patch_size=(1, 16, 16),
+            patch_jitter=1.0,
+        )
+
+        # --- 4. Setup Data ---
+        PATCH_SHAPE = (1, 16, 16)
+        N_PATCHES = 64
+        NUM_WORKERS = 12
+        METADATA_PATH = '/cbica/home/gangarav/data_25_processed/metadata.parquet'
+        scratch_dir = os.environ.get('TMP')
+        if scratch_dir is None:
+            # If the variable isn't set, raise an error or use a default.
+            # For a cluster job, it's better to fail loudly.
+            raise ValueError("Environment variable TMP is not set. This is required for the scratch directory.")
+
+        dataset = PrismOrderingDataset(
+            metadata=METADATA_PATH,
+            patch_shape=PATCH_SHAPE,
+            n_patches=N_PATCHES,
+            scratch_dir=scratch_dir
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            num_workers=NUM_WORKERS,
+            persistent_workers=(NUM_WORKERS > 0),
+            pin_memory=True,
+        )
+
+        # --- 5. Setup Callbacks and Logger ---
+        # The logger will automatically use the run initialized by wandb.init()
+        wandb_logger = WandbLogger(project="rsna25-prism-ordering", log_model="all")
+
+        # Checkpoints are saved in a directory named after the unique wandb run ID
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename='{step}',
+            save_top_k=3,
+            monitor='view_loss',
+            mode='min',
+            every_n_train_steps=5000,
+            save_last=True,
+        )
+
+        # --- 6. Setup Trainer ---
+        trainer = L.Trainer(
+            max_epochs=-1, # For iterable datasets, steps are better than epochs
+            max_steps=1000000, # Example: set a max number of steps
+            callbacks=[checkpoint_callback],
+            logger=wandb_logger,
+            log_every_n_steps=25,
+        )
+
+        # --- 7. Start Training ---
+        # The `ckpt_path` argument tells the trainer to resume from a checkpoint.
+        # If ckpt_path is None, it starts a new training run.
+        trainer.fit(
+            model=model,
+            train_dataloaders=dataloader,
+            ckpt_path=ckpt_path
+        )
+
+        wandb.finish()
+    return (train_run,)
 
 
 @app.cell
 def _():
+    # wandb_logger = WandbLogger(project="rsna25-prism-ordering")
+
+    # checkpoint_callback = ModelCheckpoint(
+    #     dirpath=f'checkpoints/{wandb_logger.version}', # Save in a run-specific folder
+    #     filename='best_model_all', # Always name the file 'best_model.ckpt'
+    #     save_top_k=1,          # Only save the single best checkpoint
+    #     monitor='view_loss',   # Metric to monitor
+    #     mode='min',            # 'min' because lower loss is better
+    #     every_n_train_steps=5000,
+    #     save_on_train_epoch_end=False
+    # )
+
+    # trainer = L.Trainer(limit_train_batches=100000, max_epochs=1000, callbacks=[checkpoint_callback], logger=wandb_logger, log_every_n_steps=25)
+    # trainer.fit(model=encoder, train_dataloaders=dataloader) #, val_dataloaders=) #
     return
 
 
 @app.cell
-def _(L, ModelCheckpoint, WandbLogger, dataloader, encoder):
-    wandb_logger = WandbLogger(project="rsna25-prism-ordering")
-
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=f'checkpoints/{wandb_logger.version}', # Save in a run-specific folder
-        filename='best_model_all', # Always name the file 'best_model.ckpt'
-        save_top_k=1,          # Only save the single best checkpoint
-        monitor='view_loss',   # Metric to monitor
-        mode='min',            # 'min' because lower loss is better
-        every_n_train_steps=5000,
-        save_on_train_epoch_end=False
-    )
-
-    trainer = L.Trainer(limit_train_batches=100000, max_epochs=1000, callbacks=[checkpoint_callback], logger=wandb_logger, log_every_n_steps=25)
-    trainer.fit(model=encoder, train_dataloaders=dataloader) #, val_dataloaders=) #
-    return
-
-
-@app.cell
-def _():
+def _(train_run):
+    default_config = {
+        'encoder_dim': 288,
+        'encoder_depth': 12,
+        'encoder_heads': 12,
+        'mlp_dim': 512,
+        'n_registers': 8,
+        'batch_size': 128,
+        'learning_rate': 1e-4,
+    }
+    train_run(default_config=default_config)
     return
 
 

@@ -28,6 +28,7 @@ def _():
         mo,
         nn,
         optim,
+        os,
         pd,
         torch,
         zarr_scan,
@@ -36,8 +37,6 @@ def _():
 
 @app.cell
 def _(L, RvT, nn, optim, torch):
-
-    # define the LightningModule
     class RadiographyEncoder(L.LightningModule):
         def __init__(
             self, *,
@@ -51,7 +50,6 @@ def _(L, RvT, nn, optim, torch):
             # training runtime hyperparameters
             batch_size,
             learning_rate,
-            training_steps,
             # dataset hyperparameters
             patch_size,
             patch_jitter,
@@ -65,6 +63,7 @@ def _(L, RvT, nn, optim, torch):
             self.n_registers=n_registers
 
             super().__init__()
+
             self.save_hyperparameters()
             self.encoder = RvT(
                 patch_size=patch_size,
@@ -115,17 +114,23 @@ def _(L, RvT, nn, optim, torch):
 
             fused_view_cls = torch.cat((emb1[:, 1], emb2[:, 1]), dim=1)
             view_prediction = self.relative_view_head(fused_view_cls)
-            print(view_prediction)
-            print(view_target)
             loss = self.view_criterion(view_prediction, view_target)
 
-            self.log("view_loss", loss)
-            return loss
+            print(view_prediction)
+
+        # def validation_step(self, batch, batch_idx):
+        #     # this is the validation loop
+        #     x, _ = batch
+        #     x = x.view(x.size(0), -1)
+        #     z = self.encoder(x)
+        #     x_hat = self.decoder(z)
+        #     val_loss = F.mse_loss(x_hat, x)
+        #     self.log("val_loss", val_loss)
 
         def configure_optimizers(self):
-            optimizer = optim.Adam(self.parameters(), lr=1e-4)
+            # Use the learning_rate from hparams so it can be configured by sweeps
+            optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
             return optimizer
-
     return (RadiographyEncoder,)
 
 
@@ -251,9 +256,35 @@ def _(iterator, run_btn):
 
 
 @app.cell
+def _(RadiographyEncoder, os, torch):
+    def get_model(RUN_ID):
+        CHECKPOINT_PATH = f"/cbica/home/gangarav/checkpoints/{RUN_ID}/last.ckpt"
+
+        if not os.path.exists(CHECKPOINT_PATH):
+            raise FileNotFoundError(f"Checkpoint file not found at: {CHECKPOINT_PATH}")
+
+        # --- Step 4: Load the Model from the Checkpoint ---
+        print(f"Loading model from checkpoint: {CHECKPOINT_PATH}")
+    
+        # This is the magic command. It will automatically read the hyperparameters
+        # saved in the .ckpt file and instantiate the model with them.
+        model = RadiographyEncoder.load_from_checkpoint(checkpoint_path=CHECKPOINT_PATH)
+    
+        model.eval()
+
+        # Move model to GPU if available
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        return model
+
+    model = get_model('3d640eau')
+    return (model,)
+
+
+@app.cell
 def _(
-    RadiographyEncoder,
     label,
+    model,
     patch_coords_1,
     patch_coords_2,
     patches_1,
@@ -261,8 +292,6 @@ def _(
     row_id,
     torch,
 ):
-    model = RadiographyEncoder.load_from_checkpoint("/gpfs/fs001/cbica/home/gangarav/rsna25/checkpoints/None/best_model_all.ckpt")
-    model.eval()
     device = next(model.parameters()).device
 
     embeddings = []
@@ -273,6 +302,12 @@ def _(
     with torch.no_grad():
         print(model.training_step(b, 0))
     print(label)
+    return
+
+
+@app.cell
+def _(label):
+    label
     return
 
 
