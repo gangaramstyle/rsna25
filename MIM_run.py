@@ -51,7 +51,7 @@ def _(IterableDataset, np, pd, random, torch, zarr_scan):
                 on='zarr_path',
                 how='left'
             )
-            self.metadata = merged_df.head(3)
+            self.metadata = merged_df.head(500)
 
             self.patch_shape = patch_shape
             self.n_patches = n_patches
@@ -97,7 +97,7 @@ def _(IterableDataset, np, pd, random, torch, zarr_scan):
                     )
 
                     print(f"[Worker {worker_id}] Yielding a training sample.")
-                    yield patches_1, patches_2, coords_1, coords_2, row_id, label, sample_1, sample_2
+                    yield patches_1, patches_2, coords_1, coords_2, row_id, label
     return (PrismOrderingDataset,)
 
 
@@ -246,7 +246,7 @@ def _(
     torch,
 ):
     def train_model():
-        OUTPUT_DIR = "trained_models"
+        OUTPUT_DIR = "FULL_trained_models"
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
         # --- Configuration ---
@@ -268,7 +268,7 @@ def _(
         REGISTER_COUNT = 8
 
         # Training parameters
-        BATCH_SIZE = 64
+        BATCH_SIZE = 128
         LEARNING_RATE = 1e-4
         TRAINING_STEPS = 100000 # Since the dataset is infinite, we train for a fixed number of steps
 
@@ -409,7 +409,7 @@ def _(
                         log_file.write(f"{step+1},{timestamp},{total_loss_item:.4f},{pos_loss.item():.4f},{mim_1_loss.item():.4f},{mim_2_loss.item():.4f}\n")
 
                 # Interim Checkpoint Saving
-                if (step + 1) % 2500 == 0:
+                if (step + 1) % 10000 == 0:
                     # Define a unique filename for the checkpoint
                     checkpoint_path = os.path.join(OUTPUT_DIR, f"MIM_{log_filename}_s_{step+1}.pth")
 
@@ -428,306 +428,12 @@ def _(
         final_model_save_path = os.path.join(OUTPUT_DIR, f"MIM_{log_filename}_s_{TRAINING_STEPS}.pth")
         torch.save(model.state_dict(), final_model_save_path)
         print(f"Final model saved to {final_model_save_path}")
-    return
+    return (train_model,)
 
 
 @app.cell
-def _():
-    # train_model()
-    return
-
-
-@app.cell
-def _(
-    DataLoader,
-    PosEmbedding3D,
-    PrismOrderingDataset,
-    SaimeseEncoder,
-    nn,
-    time,
-    torch,
-):
-    # Data parameters (MUST match between dataset and model)
-    PATCH_SHAPE = (1, 16, 16) # (Depth, Height, Width) of each patch
-    N_PATCHES = 64            # Number of patches to sample from each scan
-
-    #
-    NUM_WORKERS = 0
-
-    # Model hyperparameters
-    NUM_CLASSES = 3           # e.g., bleed vs. no_bleed
-    MODEL_DIM = 288           # Main dimension of the transformer
-    TRANSFORMER_DEPTH = 12     # Number of transformer blocks
-    TRANSFORMER_HEADS = 12     # Number of attention heads
-    MLP_DIM = 512             # Hidden dimension in the FeedForward network
-    REGISTER_COUNT = 8
-
-    # Training parameters
-    BATCH_SIZE = 4
-    LEARNING_RATE = 1e-4
-    TRAINING_STEPS = 100000 # Since the dataset is infinite, we train for a fixed number of steps
-
-    # Check if a GPU is available
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # --- Setup Logging ---
-    log_filename = f"log_{int(time.time())}.csv"
-    print(f"Logging training loss to {log_filename}")
-    with open(log_filename, 'w') as log_file:
-        log_file.write("step,timestamp,loss\n")
-
-    # --- Setup Dataset and DataLoader ---
-    print("Setting up data loader...")
-    dataset = PrismOrderingDataset(
-        metadata="THIS IS A LIE",
-        patch_shape=PATCH_SHAPE,
-        n_patches=N_PATCHES
-    )
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        num_workers=NUM_WORKERS, # Use 2 worker processes to load data in parallel
-        persistent_workers=(NUM_WORKERS > 0),
-        pin_memory=True,
-    )
-
-    # --- Setup Model ---
-
-    model = SaimeseEncoder(
-        patch_size=PATCH_SHAPE,
-        register_count=REGISTER_COUNT,
-        num_classes=NUM_CLASSES,
-        dim=MODEL_DIM,
-        depth=TRANSFORMER_DEPTH,
-        heads=TRANSFORMER_HEADS,
-        mlp_dim=MLP_DIM,
-        use_rotary=True 
-    ).to(device)
-
-    coordinate_encoder = PosEmbedding3D(MODEL_DIM//2, max_freq = 3)
-
-    # --- Setup Optimizer and Loss Function ---
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    position_criterion = nn.BCEWithLogitsLoss() 
-    mim_loss = nn.SmoothL1Loss()
-
-
-    data_iterator = iter(dataloader)
-
-    # for step in range(TRAINING_STEPS):
-    #     try:
-    #         patches_1, patches_2, idx_1, idx_2, scan, y = next(data_iterator)
-    #         print(f"======={step}======")
-
-    #         # Split patches and indices for input vs label
-    #         split_size = 50
-
-    #         input_patches_1 = patches_1[:,:split_size]
-    #         label_patches_1 = patches_1[:,split_size:]
-    #         input_idx_1 = idx_1[:,:split_size]
-    #         label_idx_1 = idx_1[:,split_size:]
-
-    #         input_patches_2 = patches_2[:,:split_size]
-    #         label_patches_2 = patches_2[:,split_size:]
-    #         input_idx_2 = idx_2[:,:split_size]
-    #         label_idx_2 = idx_2[:,split_size:]
-
-    #         # Move data to the selected device (GPU or CPU)
-    #         input_patches_1 = input_patches_1.to(device, non_blocking=True)
-    #         input_patches_2 = input_patches_2.to(device, non_blocking=True)
-    #         input_idx_1 = input_idx_1.to(device, non_blocking=True)
-    #         input_idx_2 = input_idx_2.to(device, non_blocking=True)
-    #         label_patches_1 = label_patches_1.to(device, non_blocking=True)
-    #         label_patches_2 = label_patches_2.to(device, non_blocking=True)
-    #         label_idx_1 = label_idx_1.to(device, non_blocking=True)
-    #         label_idx_2 = label_idx_2.to(device, non_blocking=True)
-    #         scan = scan.to(device, non_blocking=True)
-    #         y = y.to(device, non_blocking=True).squeeze(1)
-
-    #         y_class = (y > 0).to(torch.float32)
-
-    #         # 3. Standard training steps
-    #         optimizer.zero_grad()
-
-    #         # Forward pass
-    #         x1, x2 = model(input_patches_1, input_idx_1, input_patches_2, input_idx_2)
-
-    #         # fused_scan_cls = torch.cat((x1[:, 0], x2[:, 0]), dim = 0)
-    #         # fused_scan_cls = nn.functional.normalize(fused_scan_cls, p=2, dim=1)
-    #         # fused_scan_y = torch.cat((scan, scan), dim = 0)
-
-    #         # scan_loss = supervised_contrastive_loss(fused_scan_cls, fused_scan_y)
-
-    #         fused_pos_cls = torch.cat((x1[:, 1], x2[:, 1]), dim=1)
-    #         pos_prediction = model.trunk(fused_pos_cls)
-    #         pos_loss = position_criterion(pos_prediction, y_class)
-
-    #         mim_prediction_1 = model.mim(
-    #             interleave_tensors(coordinate_encoder(label_idx_1)),
-    #             torch.cat((x1[:, :2], x1[:,2+REGISTER_COUNT:]), dim=1)
-    #         )
-    #         mim_prediction_2 = model.mim(
-    #             interleave_tensors(coordinate_encoder(label_idx_2)),
-    #             torch.cat((x2[:, :2], x2[:,2+REGISTER_COUNT:]), dim=1)
-    #         )
-
-    #         mim_1_loss = mim_loss(mim_prediction_1, label_patches_1)
-    #         mim_2_loss = mim_loss(mim_prediction_2, label_patches_2)
-
-    #         total_loss = mim_1_loss + mim_2_loss + pos_loss
-
-    #         # Backward pass and optimization
-    #         total_loss.backward()
-    #         optimizer.step()
-
-    #         if (step + 1) % 10 == 0:
-    #             # Get the scalar value of each loss for logging
-    #             total_loss_item = total_loss.item()
-
-    #             timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
-
-    #             # A more informative print statement
-    #             print(f"Step [{step+1}/{TRAINING_STEPS}], "
-    #                   f"Total Loss: {total_loss_item:.4f}, "
-    #                   f"POS Loss: {pos_loss.item():.4f}, "
-    #                   f"MIM1 Loss: {mim_1_loss.item():.4f}, "
-    #                   f"MIM2 Loss: {mim_2_loss.item():.4f}") #, "
-    #                   # f"SCAN Loss: {scan_loss.item():.4f}")
-
-    #             # Log all three loss values for better analysis later
-    #             with open(log_filename, 'a') as log_file:
-    #                 log_file.write(f"{step+1},{timestamp},{total_loss_item:.4f},{pos_loss.item():.4f},{mim_1_loss.item():.4f},{mim_2_loss.item():.4f}\n")
-
-    #         # Interim Checkpoint Saving
-    #         if (step + 1) % 2500 == 0:
-    #             # Define a unique filename for the checkpoint
-    #             checkpoint_path = os.path.join(OUTPUT_DIR, f"MIM_{log_filename}_s_{step+1}.pth")
-
-    #             # Save the model's state dictionary
-    #             torch.save(model.state_dict(), checkpoint_path)
-
-    #             print(f"\n--- Saved interim checkpoint at step {step+1} to {checkpoint_path} ---\n")
-
-    #     except StopIteration:
-    #         # This should not happen with an infinite dataset, but is good practice
-    #         print("DataLoader exhausted. Restarting.")
-    #         data_iterator = iter(dataloader)
-
-    # print("Training finished.")
-
-    # final_model_save_path = os.path.join(OUTPUT_DIR, f"MIM_{log_filename}_s_{TRAINING_STEPS}.pth")
-    # torch.save(model.state_dict(), final_model_save_path)
-    # print(f"Final model saved to {final_model_save_path}")
-
-    return PATCH_SHAPE, data_iterator, dataset
-
-
-@app.cell
-def _(data_iterator):
-    patches_1, patches_2, idx_1, idx_2, scan, y, sample1, sample2 = next(data_iterator)
-    return idx_1, idx_2, patches_1, patches_2, sample1, scan
-
-
-@app.cell
-def _(mo, patches_1):
-    mo.vstack([
-        mo.hstack([
-            mo.image(src=patches_1[_b, _p, 0])
-            for _p in range(64)
-        ]) for _b in range(4)
-    ])
-    return
-
-
-@app.cell
-def _():
-    import marimo as mo
-    return (mo,)
-
-
-@app.cell
-def _(mo, patches_2):
-    mo.vstack([
-        mo.hstack([
-            mo.image(src=patches_2[_b, _p, 0])
-            for _p in range(64)
-        ]) for _b in range(4)
-    ])
-    return
-
-
-@app.cell
-def _(idx_1, idx_2, patches_1, patches_2):
-    print(patches_1.shape, patches_1.max(), patches_1.min())
-    print(patches_2.shape, patches_2.max(), patches_2.min())
-    print(idx_1.shape, idx_1.max(), idx_1.min())
-    print(idx_2.shape, idx_2.max(), idx_2.min())
-    return
-
-
-@app.cell
-def _(sample1):
-    sample1
-    return
-
-
-@app.cell
-def _(scan):
-    scan
-    return
-
-
-@app.cell
-def _(PATCH_SHAPE, dataset, mo, sample1, scan, zarr_scan):
-    i=0
-    row = dataset.metadata.iloc[int(scan[i])]
-    s = zarr_scan(
-        path_to_scan=row["zarr_path"],
-        median=row["median"],
-        stdev=row["stdev"],
-        patch_shape=PATCH_SHAPE
-    )
-    s_pixels = s.get_scan_array_copy().shape
-
-    scan_pixels = s.normalize_pixels_to_range(s.get_scan_array_copy(), sample1["w_min"][i], sample1["w_max"][i])
-
-    scan_pixels = s.create_rgb_scan_with_boxes(
-        scan_pixels,
-        [sample1["subset_start"][i,0]],
-        sample1["subset_shape"][i],
-        None,
-        (255, 0, 0)
-    )
-
-    # scan_pixels = scan.create_rgb_scan_with_boxes(
-    #     scan_pixels,
-    #     sample["patch_indices"],
-    #     patch_shape,
-    #     None,
-    #     (0, 255, 0)
-    # )
-
-    slider = mo.ui.slider(start=0, stop=scan_pixels.shape[0]-1,value=int(sample1["subset_center_idx"][i,0,0]))
-    slider
-    return scan_pixels, slider
-
-
-@app.cell
-def _(mo, scan_pixels, slider):
-    mo.image(src=scan_pixels[slider.value])
-    return
-
-
-@app.cell
-def _(sample1):
-    sample1["subset_start"]
-    return
-
-
-@app.cell
-def _():
+def _(train_model):
+    train_model()
     return
 
 
