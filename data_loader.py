@@ -1,12 +1,14 @@
 import marimo
 
-__generated_with = "0.14.16"
-app = marimo.App(width="medium")
+__generated_with = "0.14.17"
+app = marimo.App(width="columns")
 
 with app.setup:
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, IterableDataset
+    from math import pi
+    from einops import rearrange, repeat
     import numpy as np
     import os
     import random
@@ -15,7 +17,7 @@ with app.setup:
     import pandas as pd
     import fastparquet
     import matplotlib.pyplot as plt
-    from typing import Optional
+    from typing import Optional, Tuple, Dict, Any
     import pydicom
 
 
@@ -41,150 +43,49 @@ def _(table):
     return (metadata_row,)
 
 
-@app.cell(hide_code=True)
+@app.cell
+def _(metadata_row):
+    zarr_name = metadata_row["zarr_path"].values[0]
+    patch_shape = [1, 16, 16]
+    # n_patches
+    scan = zarr_scan(path_to_scan=zarr_name, median=metadata_row["median"].values[0], stdev=metadata_row["stdev"].values[0], patch_shape=patch_shape)
+    return patch_shape, scan
+
+
+@app.cell
+def _(scan):
+    sample = scan.train_sample(128)
+    return (sample,)
+
+
+@app.cell
 def _():
-    # _q = 0
-    # def get_patient_space_coords(row_col, image_position, image_orientation, pixel_spacing):
-    #     """
-    #     Calculates the 3D patient space coordinates for a given pixel (row, col).
+    # dim = 6*100
+    # model = PosEmbedding3D(dim, max_freq=3)
 
-    #     This function implements the logic described in the DICOM Standard, Part 3,
-    #     Section C.7.6.2.1.1 (Image Plane Module).
+    # # Get min and max for each axis
+    # min_vals = (sample["patch_centers_idx"] - sample["subset_center_idx"]).min(axis=0)
+    # max_vals = (sample["patch_centers_idx"] - sample["subset_center_idx"]).max(axis=0)
+    # print(min_vals, max_vals)
+    # # Create smooth ranges for each axis
+    # n_points = 100
+    # x_range = torch.linspace(min_vals[0], max_vals[0], n_points)
+    # y_range = torch.linspace(min_vals[1], max_vals[1], n_points)
+    # z_range = torch.linspace(min_vals[2], max_vals[2], n_points)
 
-    #     Args:
-    #         row_col (tuple or list): The (row, col) pixel indices.
-    #         image_position (list or np.ndarray): The 'Image Position (Patient)' (0020,0032) value.
-    #         image_orientation (list or np.ndarray): The 'Image Orientation (Patient)' (0020,0037) value.
-    #         pixel_spacing (list or np.ndarray): The 'Pixel Spacing' (0028,0030) value [RowSpacing, ColSpacing].
+    # # Create 100x3 tensor
+    # new_array = torch.stack([x_range, y_range, z_range], dim=1)
+    # new_array = new_array.unsqueeze(0)  # Shape: (1, 100, 3)
 
-    #     Returns:
-    #         np.ndarray: A 3-element NumPy array representing the (x, y, z) coordinates
-    #                     in the patient coordinate system.
-    #     """
-    #     row, col = row_col
+    # sin, cos = model(new_array)
 
-    #     # Ensure inputs are NumPy arrays for vectorized operations
-    #     image_pos = np.array(image_position, dtype=float)
-    #     image_orient = np.array(image_orientation, dtype=float)
-    #     pixel_sp = np.array(pixel_spacing, dtype=float)
-
-    #     # Unpack the orientation vectors
-    #     # Row vector (direction of change as column index increases)
-    #     row_vector = image_orient[:3]
-    #     # Column vector (direction of change as row index increases)
-    #     col_vector = image_orient[3:]
-
-    #     # Unpack pixel spacing
-    #     row_spacing = pixel_sp[0]
-    #     col_spacing = pixel_sp[1]
-
-    #     # Calculate the final position
-    #     # Formula: StartPoint + (Movement along rows) + (Movement along columns)
-    #     # Note: DICOM standard uses (i, j) for (col, row), which can be confusing.
-    #     # Here we use explicit variable names to be clear.
-    #     patient_coords = image_pos + (col * col_spacing * row_vector) + (row * row_spacing * col_vector)
-
-    #     return patient_coords
-
-    # # XYZ
-    # patch_idx = [0, 0, 100]
-    # dicom_dir = metadata_row["raw_path"].values[0]
-    # dicom_files = sorted(
-    #     [os.path.join(dicom_dir, f) for f in os.listdir(dicom_dir) if f.endswith('.dcm')],
-    #     key=lambda fpath: int(pydicom.dcmread(fpath, stop_before_pixels=True).InstanceNumber)
-    # )
-    # dicom_path = os.path.join(dicom_dir, dicom_files[patch_idx[0]])
-    # ds = pydicom.dcmread(dicom_path)
-    # ds
-
-    # img_pos_patient = ds.ImagePositionPatient
-    # img_orient_patient = ds.ImageOrientationPatient
-    # pixel_spc = ds.PixelSpacing
-    # print("image pos patient:", img_pos_patient)
-    # print("image orientation patient:", img_orient_patient)
-    # print("pixel_spacing:", pixel_spc)
-
-    # pixel_coordinate = patch_idx[1:]
-
-    # # --- Calculation ---
-    # patient_coordinate_3d = get_patient_space_coords(
-    #     row_col=pixel_coordinate,
-    #     image_position=img_pos_patient,
-    #     image_orientation=img_orient_patient,
-    #     pixel_spacing=pixel_spc
-    # )
-    # mo.vstack([
-    #     patient_coordinate_3d,
-    #     mo.image(src=ds.pixel_array)
-    # ])
-
+    # mo.image(src=sin[0], width=512)
     return
 
 
 @app.cell
-def _(metadata_row):
-    zarr_name = metadata_row["zarr_path"].values[0]
-    patch_shape = [1, 32, 32]
-    scan = zarr_scan(path_to_scan=zarr_name, median=metadata_row["median"].values[0], stdev=metadata_row["stdev"].values[0], patch_shape=patch_shape)
-
-    r_wc, r_ww = scan.get_random_wc_ww_for_scan()
-
-    subset_1_start, subset_1_shape = scan.get_random_subset_from_scan()
-    idxs_1 = scan.get_random_patch_indices_from_scan_subset(subset_1_start, subset_1_shape, 5)
-    patches_1 = scan.normalize_pixels_to_range(scan.get_patches_from_indices(idxs_1), r_wc - 0.5*r_ww, r_wc + 0.5*r_ww)
-    patches_1_center = (idxs_1 + 0.5*np.array(patch_shape)).astype(int)
-    patches_1_pt_space = scan.convert_indices_to_patient_space(patches_1_center)
-    subset_1_center = np.array(subset_1_start) + 0.5*np.array(subset_1_shape)
-    subset_1_center = subset_1_center.astype(int)[np.newaxis, :]
-    subset_1_center_pt_space = scan.convert_indices_to_patient_space(subset_1_center)
-
-    subset_2_start, subset_2_shape = scan.get_random_subset_from_scan()
-    idxs_2 = scan.get_random_patch_indices_from_scan_subset(subset_2_start, subset_2_shape, 5)
-    patches_2 = scan.normalize_pixels_to_range(scan.get_patches_from_indices(idxs_2), r_wc - 0.5*r_ww, r_wc + 0.5*r_ww)
-    patches_2_center = (idxs_2 + 0.5*np.array(patch_shape)).astype(int)
-    patches_2_pt_space = scan.convert_indices_to_patient_space(patches_2_center)
-    subset_2_center = np.array(subset_2_start) + 0.5*np.array(subset_2_shape)
-    subset_2_center = subset_2_center.astype(int)[np.newaxis, :]
-    subset_2_center_pt_space = scan.convert_indices_to_patient_space(subset_2_center)
-
-
-    scan_pixels = scan.normalize_pixels_to_range(scan.get_scan_array_copy(), r_wc - 0.5*r_ww, r_wc + 0.5*r_ww)
-    scan_pixels = scan.create_rgb_scan_with_boxes(
-        scan_pixels,
-        [subset_1_start],
-        subset_1_shape,
-        None,
-        (255, 0, 0)
-    )
-    scan_pixels = scan.create_rgb_scan_with_boxes(
-        scan_pixels,
-        idxs_1,
-        patch_shape,
-        None,
-        (0, 255, 0)
-    )
-    scan_pixels = scan.create_rgb_scan_with_boxes(
-        scan_pixels,
-        [subset_2_start],
-        subset_2_shape,
-        None,
-        (0, 0, 255)
-    )
-    scan_pixels = scan.create_rgb_scan_with_boxes(
-        scan_pixels,
-        idxs_2,
-        patch_shape,
-        None,
-        (0, 255, 0)
-    )
-
-    slider = mo.ui.slider(start=0, stop=scan_pixels.shape[0]-1,value=int(scan_pixels.shape[0]/2))
-    return scan_pixels, slider
-
-
-@app.cell
-def _(slider):
-    slider
+def _(sample):
+    sample
     return
 
 
@@ -194,16 +95,119 @@ def _(scan_pixels, slider):
     return
 
 
+@app.cell
+def _(patch_shape, sample, scan):
+    scan_pixels = scan.normalize_pixels_to_range(scan.get_scan_array_copy(), sample["wc"] - 0.5*sample["ww"], sample["wc"] + 0.5*sample["ww"])
+
+    scan_pixels = scan.create_rgb_scan_with_boxes(
+        scan_pixels,
+        [sample["subset_start"]],
+        sample["subset_shape"],
+        None,
+        (255, 0, 0)
+    )
+    scan_pixels = scan.create_rgb_scan_with_boxes(
+        scan_pixels,
+        sample["patch_indices"],
+        patch_shape,
+        None,
+        (0, 255, 0)
+    )
+
+    slider = mo.ui.slider(start=0, stop=scan_pixels.shape[0]-1,value=int(sample["subset_center_idx"][0,0]))
+    slider
+    return scan_pixels, slider
+
+
 @app.class_definition
 class zarr_scan():
 
     def __init__(self, path_to_scan, median, stdev, patch_shape=(1, 16, 16)):
         self.zarr_store = zarr.open(path_to_scan, mode='r')
-        self.patch_shape = patch_shape
+        self.patch_shape = np.array(patch_shape)
         self.med = median
         self.std = stdev
 
-    # not to be used in training loops, this is just helpful for visualizing steps
+    def generate_training_pair(self, n_patches: int, to_torch: bool = True) -> tuple:
+        """
+        A high-level helper for training loops that generates a pair of samples.
+        """
+
+        wc, ww = self.get_random_wc_ww_for_scan()
+        sample_1_data = self.train_sample(n_patches=n_patches, wc=wc, ww=ww)
+        sample_2_data = self.train_sample(n_patches=n_patches, wc=wc, ww=ww)
+
+        patches_1 = sample_1_data['normalized_patches']
+        patches_2 = sample_2_data['normalized_patches']
+        patch_coords_1 = sample_1_data['patch_centers_pt'] - sample_1_data['subset_center_pt']
+        patch_coords_2 = sample_2_data['patch_centers_pt'] - sample_2_data['subset_center_pt']
+
+        label = sample_2_data['subset_center_pt'] - sample_1_data['subset_center_pt']
+        label = label.squeeze(0)
+
+        if to_torch:
+            patches_1 = torch.from_numpy(patches_1).to(torch.float32)
+            patches_2 = torch.from_numpy(patches_2).to(torch.float32)
+            patch_coords_1 = torch.from_numpy(patch_coords_1).to(torch.float32)
+            patch_coords_2 = torch.from_numpy(patch_coords_2).to(torch.float32)
+            label = torch.from_numpy(label).to(torch.float32)
+
+        return patches_1, patches_2, patch_coords_1, patch_coords_2, label
+
+    def train_sample(
+        self,
+        n_patches: int,
+        *, # Force subsequent arguments to be keyword-only for clarity
+        subset_start: Optional[Tuple[int, int, int]] = None,
+        subset_shape: Optional[Tuple[int, int, int]] = None,
+        patch_indices: Optional[np.ndarray] = None,
+        wc: Optional[float] = None,
+        ww: Optional[float] = None
+    ) -> Dict[str, Any]:
+        results = {}
+
+        if wc is None or ww is None:
+            wc, ww = self.get_random_wc_ww_for_scan()
+        results['wc'], results['ww'] = wc, ww
+        results['w_min'], results['w_max'] = wc - 0.5 * ww, wc + 0.5 * ww
+
+        if patch_indices is not None:
+            results['patch_indices'] = patch_indices
+            n_patches = patch_indices.shape[0]
+            # If indices are provided, we don't know the parent subset
+        else:
+            if subset_start is None or subset_shape is None:
+                subset_start, subset_shape = self.get_random_subset_from_scan(n_patches)
+            results['subset_start'], results['subset_shape'] = subset_start, subset_shape
+
+            patch_indices = self.get_stratified_random_patch_indices(
+                subset_start, subset_shape, n_patches
+            )
+            results['patch_indices'] = patch_indices
+
+        if 'subset_start' in results and 'subset_shape' in results:
+            ss_start = np.array(results['subset_start'])
+            ss_shape = np.array(results['subset_shape'])
+            subset_center_idx = (ss_start + 0.5 * ss_shape).astype(int)[np.newaxis, :]
+            results['subset_center_idx'] = subset_center_idx
+            results['subset_center_pt'] = self.convert_indices_to_patient_space(subset_center_idx)
+
+        raw_patches = self.get_patches_from_indices(results['patch_indices'])
+        results['raw_patches'] = raw_patches
+
+        normalized_patches = self.normalize_pixels_to_range(
+            raw_patches, results['w_min'], results['w_max']
+        )
+        results['normalized_patches'] = normalized_patches
+
+        patch_centers_idx = (results['patch_indices'] + 0.5 * self.patch_shape).astype(int)
+        results['patch_centers_idx'] = patch_centers_idx
+
+        patch_centers_pt = self.convert_indices_to_patient_space(patch_centers_idx)
+        results['patch_centers_pt'] = patch_centers_pt
+
+        return results
+
     def get_scan_array_copy(self):
         return self.zarr_store['pixel_data'][:]
 
@@ -218,6 +222,7 @@ class zarr_scan():
     ):
 
         volume = array.astype(np.float32)
+
         if len(volume.shape) == 3:
             # Grayscale volume
             d, r, c = volume.shape
@@ -258,77 +263,221 @@ class zarr_scan():
         return random.uniform(self.med-self.std, self.med+self.std), random.uniform(self.std, 6*self.std)
 
     def normalize_pixels_to_range(self, pixel_array, w_min, w_max, out_range=(-1.0, 1.0)):
+        # Ensure w_max is greater than w_min to avoid division by zero
+        if w_max <= w_min:
+            w_max = w_min + 1e-6
+
         clipped_array = np.clip(pixel_array, w_min, w_max)
         scaled_01 = (clipped_array - w_min) / (w_max - w_min)
         out_min, out_max = out_range
         return scaled_01 * (out_max - out_min) + out_min
 
-    def get_random_subset_from_scan(self, min_subset_shape=(4,32,32), max_subset_shape=None, percent_outer_to_ignore=(0.0, 0.2, 0.2)):
-        array_shape = self.zarr_store['pixel_data'].shape
-        depth, rows, cols = array_shape
 
-        if not all(array_shape[i] >= self.patch_shape[i] for i in range(3)):
+    def get_random_subset_from_scan(self, n_patches: int, min_subset_shape=(4,32,32), max_subset_shape=(10,128,128), percent_outer_to_ignore=(0.05, 0.2, 0.2), volume_scale_factor = 1.0):
+        """
+        Selects a random subset from the scan, with its shape determined by the
+        number of patches requested. The volume of the subset will be approximately
+        n_patches * patch_volume, while respecting min/max shape constraints.
+        """
+        array_shape = np.array(self.zarr_store['pixel_data'].shape)
+
+        if not all(array_shape >= self.patch_shape):
             raise ValueError("array_shape must be larger than or equal to patch_shape in all dimensions.")
 
-        if max_subset_shape is None:
-            max_subset_shape = tuple(dim // 4 for dim in array_shape)
+        # 1. Define bounds for subset shape based on scan size and constraints
+        d_buffer = int(array_shape[0] * percent_outer_to_ignore[0])
+        r_buffer = int(array_shape[1] * percent_outer_to_ignore[1])
+        c_buffer = int(array_shape[2] * percent_outer_to_ignore[2])
 
-        # Ensure min/max subset shapes are valid
-        if not all(min_subset_shape[i] >= self.patch_shape[i] for i in range(3)):
-            raise ValueError("min_subset_shape must be >= patch_shape in all dimensions.")
-        if not all(max_subset_shape[i] >= min_subset_shape[i] for i in range(3)):
-            raise ValueError("max_subset_shape must be >= min_subset_shape in all dimensions.")
+        # Min shape must be at least as large as a patch
+        min_bounds = np.maximum(min_subset_shape, self.patch_shape).astype(int)
 
-        d_buffer, r_buffer, c_buffer = percent_outer_to_ignore
-        d_buffer = depth * d_buffer
-        r_buffer = rows * r_buffer
-        c_buffer = cols * c_buffer
+        # Max shape is constrained by user input and the available scan size after buffering
+        max_bounds = np.minimum(max_subset_shape, array_shape - 2 * np.array([d_buffer, r_buffer, c_buffer])).astype(int)
 
-        # a) Determine the random size of the subset
-        # The size must be between min_subset_shape and min(max_subset_shape, array_shape)
-        subset_d = np.random.randint(min_subset_shape[0], min(max_subset_shape[0], depth - 2*d_buffer) + 1)
-        subset_r = np.random.randint(min_subset_shape[1], min(max_subset_shape[1], rows - 2*r_buffer) + 1)
-        subset_c = np.random.randint(min_subset_shape[2], min(max_subset_shape[2], cols - 2*c_buffer) + 1)
+        if not np.all(max_bounds >= min_bounds):
+             raise ValueError(f"Could not find a valid subset shape. Check min/max_subset_shape and scan dimensions. Min: {min_bounds}, Max: {max_bounds}")
+
+        # 2. Calculate the target volume for the subset
+        patch_volume = np.prod(self.patch_shape)
+        target_volume = n_patches * patch_volume * volume_scale_factor
+
+        # 3. Generate a random, flexible shape that approximates the target volume
+        # We do this sequentially, constraining each subsequent dimension's random range.
+        min_d, min_r, min_c = min_bounds
+        max_d, max_r, max_c = max_bounds
+
+        # Determine valid range for depth (d)
+        # The range for 'd' is constrained by what is possible for 'r' and 'c'.
+        d_lower_for_rand = max(min_d, target_volume / (max_r * max_c))
+        d_upper_for_rand = min(max_d, target_volume / (min_r * min_c))
+        # Ensure the range is valid before sampling
+        if d_lower_for_rand > d_upper_for_rand:
+            d_lower_for_rand = d_upper_for_rand
+        subset_d = np.random.randint(int(d_lower_for_rand), int(d_upper_for_rand) + 1)
+
+        # Determine valid range for rows (r), given the chosen depth
+        target_area_rc = target_volume / subset_d
+        r_lower_for_rand = max(min_r, target_area_rc / max_c)
+        r_upper_for_rand = min(max_r, target_area_rc / min_c)
+
+        if r_lower_for_rand > r_upper_for_rand:
+            r_lower_for_rand = r_upper_for_rand
+        subset_r = np.random.randint(int(r_lower_for_rand), int(r_upper_for_rand) + 1)
+
+        rounded_subset_r = (subset_r // self.patch_shape[1]) * self.patch_shape[1]
+        # Calculate the final dimension (c) to meet the target volume, then clip to its bounds
+        subset_c_float = target_area_rc / rounded_subset_r
+        subset_c = int(round(subset_c_float))
+        subset_c = np.clip(subset_c, min_c, max_c)
+
         subset_shape = (subset_d, subset_r, subset_c)
 
-        # b) Determine the random starting position of the subset
-        # The starting point must allow the subset to fit entirely within the main array.
-        max_start_d = depth - subset_d - d_buffer
-        max_start_r = rows - subset_r - r_buffer
-        max_start_c = cols - subset_c - c_buffer
+        # print("d:", d_lower_for_rand, d_upper_for_rand, "->", subset_d)
+        # print("r:", r_lower_for_rand, r_upper_for_rand, "->", subset_r)
+        # print("c:", target_area_rc, subset_r, target_area_rc / subset_r, subset_r//self.patch_shape[1], "->", subset_c)
+        # print("patch vol: ", n_patches * patch_volume)
+        # print("target vol: ", target_volume)
+        # print("actual vol: ", np.product(subset_shape))
 
-        subset_start_d = np.random.randint(d_buffer, max_start_d + 1)
-        subset_start_r = np.random.randint(r_buffer, max_start_r + 1)
-        subset_start_c = np.random.randint(c_buffer, max_start_c + 1)
-        subset_start = (subset_start_d, subset_start_r, subset_start_c)
+        # 4. Determine the random starting position for the generated subset shape
+        max_start_d = array_shape[0] - subset_d - d_buffer
+        max_start_r = array_shape[1] - subset_r - r_buffer
+        max_start_c = array_shape[2] - subset_c - c_buffer
+
+        # Ensure start buffer is not larger than max start pos
+        start_d = np.random.randint(d_buffer, max_start_d + 1)
+        start_r = np.random.randint(r_buffer, max_start_r + 1)
+        start_c = np.random.randint(c_buffer, max_start_c + 1)
+
+        subset_start = (start_d, start_r, start_c)
 
         return subset_start, subset_shape
 
-    def get_random_patch_indices_from_scan_subset(self, subset_start, subset_shape, n_patches):
+    def get_stratified_random_patch_indices(self, 
+                                            subset_start, 
+                                            subset_shape, 
+                                            n_patches, 
+                                            grid_density_factor=1.0, 
+                                            randomness_factor=0.33):
+        """
+        Generates patch start indices using a stratified sampling approach.
+
+        The method divides the subset into a 3D grid, samples grid cells
+        (with replacement), and then jitters the patch location within or 
+        around the selected grid cell.
+
+        Args:
+            subset_start (tuple or list): The (d, r, c) start coordinate of the subset 
+                                          within the larger scan.
+            subset_shape (tuple or list): The (d, r, c) shape of the subset from 
+                                          which to sample.
+            n_patches (int): The total number of patches to sample.
+            grid_density_factor (float): Adjusts the density of the sampling grid.
+                - 1.0: The volume of each grid cell is roughly `subset_volume / n_patches`.
+                - > 1.0: More, smaller grid cells. Increases stratification.
+                - < 1.0: Fewer, larger grid cells. Approaches pure random sampling.
+            randomness_factor (float): Controls the jitter of the patch start relative
+                                     to its grid cell center.
+                - 0.0: The patch is perfectly centered within its random offset.
+                - 1.0: The patch can be placed anywhere within its grid cell.
+                - > 1.0: The patch can be placed outside its own grid cell,
+                         creating overlap with neighbors.
+
+        Returns:
+            np.ndarray: An array of shape (n_patches, 3) containing the absolute
+                        (d, r, c) start coordinates for each patch.
+        """
         patch_d, patch_r, patch_c = self.patch_shape
         subset_start_d, subset_start_r, subset_start_c = subset_start
         subset_d, subset_r, subset_c = subset_shape
 
-        # The starting index of a patch must allow it to fit entirely within the subset.
+        patch_vol = patch_d * patch_r * patch_c
+        subset_vol = subset_d * subset_r * subset_c
+
+        # This prevents division by zero if patch_vol or n_patches is 0.
+        if patch_vol == 0 or n_patches == 0:
+            return np.empty((0, 3), dtype=int)
+
+        grid_cell_shape = np.array([patch_d, patch_r, patch_c])
+
+        # Number of grid cells along each dimension
+        n_grid_cells = np.maximum(1, (np.array(subset_shape) / grid_cell_shape)).astype(int)
+
+        # Recalculate the actual grid cell shape to perfectly tile the subset
+        grid_cell_shape_actual = np.array(subset_shape) / n_grid_cells
+
+        # --- 2. Generate all possible Grid Centers ---
+        # Create coordinates for the center of each grid cell.
+        grid_centers_d = np.arange(subset_d)
+        grid_centers_r = np.linspace(grid_cell_shape_actual[1] / 2, subset_shape[1] - grid_cell_shape_actual[1] / 2, n_grid_cells[1])
+        grid_centers_c = np.linspace(grid_cell_shape_actual[2] / 2, subset_shape[2] - grid_cell_shape_actual[2] / 2, n_grid_cells[2])
+
+        # Create a meshgrid and flatten it to get a list of all grid center coordinates
+        zz, yy, xx = np.meshgrid(grid_centers_d, grid_centers_r, grid_centers_c, indexing='ij')
+        all_grid_centers = np.vstack([zz.ravel(), yy.ravel(), xx.ravel()]).T
+
+        # --- 3. Sample Grid Centers with Replacement ---
+        # This is the "cleaner" way to handle the probabilistic selection. Instead
+        # of looping with a certain probability, we simply draw n_patches samples
+        # from the list of all centers. `replace=True` allows a center to be
+        # chosen multiple times, achieving your desired outcome.
+        n_total_centers = len(all_grid_centers)
+        if n_total_centers == 0:
+            return np.empty((0, 3), dtype=int)
+
+        rng = np.random.default_rng()
+        random_indices = np.concatenate([rng.permutation(np.arange(n_total_centers)), rng.permutation(np.arange(n_total_centers))])[:n_patches]
+        sampled_centers = all_grid_centers[random_indices]
+
+        # --- 4. Sample a Patch Near Each Selected Grid Center ---
+        # For each center, calculate a random offset.
+        half_grid_cell = grid_cell_shape_actual / 2.0
+
+        # The random offset is scaled by the randomness_factor
+        max_offset = half_grid_cell * randomness_factor
+
+        # Generate random offsets for each patch from a uniform distribution
+        random_offsets = np.random.uniform(-max_offset, max_offset, size=(n_patches, 3))
+        random_offsets[:,0] = 0 # don't need to randomize the D axis
+
+        # The ideal start is the (center + offset) - half_patch_size
+        patch_half_shape = np.array(self.patch_shape) / 2.0
+        patch_half_shape[0] = 0
+        relative_starts = (sampled_centers + random_offsets) - patch_half_shape
+
+        # --- 5. Clamp Patch Starts to Valid Subset Boundaries ---
+        # Ensure the patch does not go outside the subset dimensions.
+        max_patch_start = np.array(subset_shape) - np.array(self.patch_shape)
+        # Ensure max start is not negative (if subset is smaller than patch)
+        max_patch_start = np.maximum(0, max_patch_start)
+
+        # np.clip is perfect for this clamping operation
+        clamped_relative_starts = np.clip(relative_starts, 0, max_patch_start)
+
+        # --- 6. Convert to Absolute Coordinates and Return ---
+        absolute_starts = (np.array(subset_start) + clamped_relative_starts).astype(int)
+
+        return absolute_starts
+
+
+    def get_true_random_patch_indices_from_scan_subset(self, subset_start, subset_shape, n_patches):
+        patch_d, patch_r, patch_c = self.patch_shape
+        subset_start_d, subset_start_r, subset_start_c = subset_start
+        subset_d, subset_r, subset_c = subset_shape
+
         max_patch_start_d = subset_d - patch_d
         max_patch_start_r = subset_r - patch_r
         max_patch_start_c = subset_c - patch_c
 
-        # Generate N random starting indices *relative to the subset's corner*
-        # This is much more efficient than a for-loop.
         patch_starts_relative_d = np.random.randint(0, max_patch_start_d + 1, size=n_patches)
         patch_starts_relative_r = np.random.randint(0, max_patch_start_r + 1, size=n_patches)
         patch_starts_relative_c = np.random.randint(0, max_patch_start_c + 1, size=n_patches)
 
-        # --- 3. Convert Patch Indices to Absolute Coordinates ---
-
-        # Add the subset's starting offset to get the final indices in the main array's space.
         absolute_starts_d = subset_start_d + patch_starts_relative_d
         absolute_starts_r = subset_start_r + patch_starts_relative_r
         absolute_starts_c = subset_start_c + patch_starts_relative_c
 
-        # Stack the coordinates into an (N, 3) array for easy use.
-        # The format is (z, y, x) which corresponds to (depth, cols, rows).
         patch_indices = np.column_stack((
             absolute_starts_d,
             absolute_starts_r,
@@ -340,38 +489,62 @@ class zarr_scan():
         n_patches = patch_indices.shape[0]
         patch_d, patch_r, patch_c = self.patch_shape
 
-        d_range = np.arange(patch_d).reshape(1, -1, 1, 1)
-        r_range = np.arange(patch_r).reshape(1, 1, -1, 1)
-        c_range = np.arange(patch_c).reshape(1, 1, 1, -1)
+        # --- Step 1: Calculate the bounding box for all patches ---
+        # Find the top-left-front corner of the entire region
+        min_coords = np.min(patch_indices, axis=0)
 
-        start_indices = patch_indices.reshape(n_patches, -1, 1, 1, 1)
-        start_d, start_r, start_c = start_indices[:, 0], start_indices[:, 1], start_indices[:, 2]
+        # Find the bottom-right-back corner of the entire region
+        # We need the start of the last patch + its size
+        max_coords = np.max(patch_indices, axis=0)
+        end_coords = max_coords + np.array([patch_d, patch_r, patch_c])
 
-        final_d = start_d + d_range
-        final_r = start_r + r_range
-        final_c = start_c + c_range
+        min_d, min_r, min_c = min_coords
+        end_d, end_r, end_c = end_coords
 
-        return self.zarr_store['pixel_data'][final_d, final_r, final_c]
+        # --- Step 2: Make ONE large read from the Zarr store ---
+        # This reads the entire bounding box into a single NumPy array in memory.
+        # This is the ONLY interaction with the Zarr store.
+        super_patch = self.zarr_store['pixel_data'][min_d:end_d, min_r:end_r, min_c:end_c]
+
+        # --- Step 3: Extract individual patches from the in-memory super_patch ---
+        # Pre-allocate the final array for efficiency
+        patches = np.empty((n_patches, patch_d, patch_r, patch_c), dtype=super_patch.dtype)
+
+        for i, (d, r, c) in enumerate(patch_indices):
+            # Calculate the patch's position *relative* to the super_patch's origin
+            d_rel, r_rel, c_rel = d - min_d, r - min_r, c - min_c
+
+            # Slice the patch from the in-memory NumPy array (this is extremely fast)
+            patches[i] = super_patch[
+                d_rel : d_rel + patch_d,
+                r_rel : r_rel + patch_r,
+                c_rel : c_rel + patch_c
+            ]
+
+        return patches
 
     def convert_indices_to_patient_space(self, patch_indices):
-        affine_matrix = self.zarr_store['slice_affines']
+        affine_matrices = self.zarr_store['slice_affines'][:] # Load into memory
 
-        affine_matrix_indices = patch_indices[:, 0]
-        selected_affine_matrices = affine_matrix[affine_matrix_indices] # Shape: (4, 4, 3)
+        # We need the affine matrix for the *starting slice* of each patch
+        slice_indices = patch_indices[:, 0]
+        selected_affine_matrices = affine_matrices[slice_indices]
+
+        # Homogeneous coordinates for (r, c) -> (r, c, 1)
+        # Note: DICOM standard is often (x, y) which maps to (c, r)
+        # We assume indices are (d, r, c) and affines map (r, c)
         coords_rc = patch_indices[:, 1:]
         ones_column = np.ones((coords_rc.shape[0], 1))
-        homogeneous_coords = np.hstack([coords_rc, ones_column]) # Shape: (4, 3)
+        # Create homogeneous coordinates in (c, r, 1) order for standard affine multiplication
+        homogeneous_coords = np.hstack([coords_rc[:, ::-1], ones_column])
 
-        # Reshape homogeneous_coords to (4, 3, 1) to enable matmul broadcasting
-        reshaped_coords = homogeneous_coords[:, :, np.newaxis]
+        # Batched matrix multiplication: (N, 3, 3) @ (N, 3, 1) -> (N, 3, 1)
+        patient_coords = np.matmul(
+            selected_affine_matrices,
+            homogeneous_coords[:, :, np.newaxis]
+        ).squeeze(axis=2)
 
-        # Perform the batched matrix multiplication
-        matmul_results = selected_affine_matrices @ reshaped_coords
-        # The result is of shape (4, 4, 1), so we squeeze out the last dimension
-        matmul_results = np.squeeze(matmul_results, axis=2)
-        matmul_results = matmul_results
-
-        return matmul_results[:, :3]
+        return patient_coords[:,:-1]
 
 
 @app.cell

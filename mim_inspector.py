@@ -8,7 +8,7 @@ app = marimo.App(width="medium")
 def _():
     from data_loader import zarr_scan
     from torch.utils.data import DataLoader, IterableDataset
-    from rvt_model import RvT, CoordinateRotaryEmbedding3D
+    from rvt_model import RvT, PosEmbedding3D
     import torch
     import torch.nn as nn
     from x_transformers import CrossAttender
@@ -25,11 +25,11 @@ def _():
     import altair as alt
     from sklearn.decomposition import PCA
     return (
-        CoordinateRotaryEmbedding3D,
         CrossAttender,
         DataLoader,
         IterableDataset,
         PCA,
+        PosEmbedding3D,
         RvT,
         alt,
         mo,
@@ -73,91 +73,66 @@ def _(merged_df):
 
 
 @app.cell
-def _(IterableDataset, merged_df, np, random, torch, zarr_scan):
-    def normalize_hu_to_range(hu_array, w_min, w_max, out_range=(-1.0, 1.0)):
-        clipped_array = np.clip(hu_array, w_min, w_max)
-        scaled_01 = (clipped_array - w_min) / (w_max - w_min)
-        out_min, out_max = out_range
-        return scaled_01 * (out_max - out_min) + out_min
-
-    def get_random_clamping_range(median, stdev):
-        lower_bound = median - 3 * stdev
-        upper_bound = median + 3 * stdev
-        if lower_bound >= upper_bound:
-            return lower_bound, upper_bound
-        point1 = np.random.uniform(lower_bound, upper_bound)
-        point2 = np.random.uniform(lower_bound, upper_bound)
-        return min(point1, point2), max(point1, point2)
-
+def _(IterableDataset, np, pd, random, torch, zarr_scan):
     class PrismOrderingDataset(IterableDataset):
 
-        def __init__(self, metadata, patch_shape, n_patches):
+        def __init__(self, metadata, patch_shape, n_patches, n_sampled_from_same_study=8):
             super().__init__()
-            self.metadata = merged_df.head(1000)
+            stats_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/zarr_stats.parquet')
+            og_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/metadata.parquet')
+            merged_df = pd.merge(
+                og_pd,
+                stats_pd,
+                on='zarr_path',
+                how='left'
+            )
+            self.metadata = merged_df.head(3)
+
             self.patch_shape = patch_shape
             self.n_patches = n_patches
-            self.n_sampled_from_same_study = 32
+            self.n_sampled_from_same_study = n_sampled_from_same_study
 
         def __iter__(self):
-            # The __iter__ method is called once per worker process.
-            # We need to handle seeding properly for multiprocessing.
             worker_info = torch.utils.data.get_worker_info()
+            worker_id = worker_info.id if worker_info else 0 # Get worker ID
 
-            # If in a worker process, we need to re-seed to ensure each worker
-            # generates a different stream of random data.
             if worker_info is not None:
-
                 seed = (torch.initial_seed() + worker_info.id) % (2**32)
-
-                # This print statement might still not appear depending on your OS/IDE,
-                # but the seeding logic below is now correct.
-                print(f"Worker {worker_info.id} is using seed: {seed}", flush=True)
-
                 np.random.seed(seed)
                 random.seed(seed)
 
             while True:
-
+                print(f"[Worker {worker_id}] Sampling a study...")
                 sample = self.metadata.sample(n=1)
+                zarr_name = sample["zarr_path"].values[0]
+                print(f"[Worker {worker_id}] Selected scan: {zarr_name}")
 
                 row_id = sample.index.values[0]
-                zarr_name = sample["zarr_path"].values[0]
                 median = sample["median"].values[0]
                 stdev = sample["stdev"].values[0]
 
-                scan = zarr_scan(path_to_scan=zarr_name)
+                # 2. Instantiate the scan loader with all necessary info
+                try:
+                    scan = zarr_scan(
+                        path_to_scan=zarr_name,
+                        median=median,
+                        stdev=stdev,
+                        patch_shape=self.patch_shape
+                    )
+                except (ValueError, FileNotFoundError) as e:
+                    print(f"[Worker {worker_id}] CRITICAL: Skipping scan {zarr_name} due to error: {e}")
+                    continue
 
-                for i in range(self.n_sampled_from_same_study):
-                    w_min, w_max = median - 3*stdev, median + 3*stdev
 
-                    # subset_start = (np.array(scan.zarr_store["pixel_data"].shape) // 4).astype(int)
-                    # subset_shape = (np.array(scan.zarr_store["pixel_data"].shape) // 2).astype(int)
+                print(f"[Worker {worker_id}] Generating pairs for {zarr_name}...")
+                for _ in range(self.n_sampled_from_same_study):
+                    patches_1, patches_2, coords_1, coords_2, label, sample_1, sample_2 = scan.generate_training_pair(
+                        n_patches=self.n_patches,
+                        to_torch=True
+                    )
 
-                    subset_1_start, subset_1_shape = scan.get_random_subset_from_scan()
-                    idxs_1 = scan.get_random_patch_indices_from_scan_subset(subset_1_start, subset_1_shape, self.n_patches)
-                    patches_1 = normalize_hu_to_range(scan.get_patches_from_indices(idxs_1), w_min, w_max)
-                    patches_1_pt_space = scan.convert_indices_to_patient_space(idxs_1)
-                    subset_1_center = np.array(subset_1_start) + 0.5*np.array(subset_1_shape)
-                    subset_1_center = subset_1_center.astype(int)[np.newaxis, :]
-                    subset_1_center_pt_space = scan.convert_indices_to_patient_space(subset_1_center)
-                    patches_1_pt_space = patches_1_pt_space - subset_1_center_pt_space
-
-                    subset_2_start, subset_2_shape = scan.get_random_subset_from_scan()
-                    idxs_2 = scan.get_random_patch_indices_from_scan_subset(subset_2_start, subset_2_shape, self.n_patches)
-                    patches_2 = normalize_hu_to_range(scan.get_patches_from_indices(idxs_2), w_min, w_max)
-                    patches_2_pt_space = scan.convert_indices_to_patient_space(idxs_2)
-                    subset_2_center = np.array(subset_2_start) + 0.5*np.array(subset_2_shape)
-                    subset_2_center = subset_2_center.astype(int)[np.newaxis, :]
-                    subset_2_center_pt_space = scan.convert_indices_to_patient_space(subset_2_center)
-                    patches_2_pt_space = patches_2_pt_space - subset_2_center_pt_space
-
-                    patches_1_torch = torch.from_numpy(patches_1).to(torch.float32)
-                    patches_2_torch = torch.from_numpy(patches_2).to(torch.float32)
-                    idx_pt_space_1_torch = torch.from_numpy(patches_1_pt_space).to(torch.float32)
-                    idx_pt_space_2_torch = torch.from_numpy(patches_2_pt_space).to(torch.float32)
-                    label = torch.tensor(subset_2_center_pt_space - subset_1_center_pt_space, dtype=torch.float32)
-
-                    yield patches_1_torch, patches_2_torch, idx_pt_space_1_torch, idx_pt_space_2_torch, row_id, label, subset_1_start, subset_1_shape, subset_2_start, subset_2_shape
+                    print(f"[Worker {worker_id}] Yielding a training sample.")
+                    yield patches_1, patches_2, coords_1, coords_2, row_id, label, sample_1, sample_2
     return (PrismOrderingDataset,)
 
 
@@ -234,15 +209,9 @@ def _(nn, torch):
         device = embeddings.device
         n = embeddings.shape[0]
 
-        print("embeddings")
-        print(embeddings)
-
         # 1. Calculate all-pairs similarity
         # The result is a matrix of shape [N, N]
         similarity_matrix = embeddings @ embeddings.t()
-
-        print("similarity_matrix")
-        print(similarity_matrix)
 
         # 2. Create the positive-pair mask
         # The mask will be True where labels are the same, False otherwise.
@@ -250,9 +219,6 @@ def _(nn, torch):
         # labels.unsqueeze(1) creates a column vector [N, 1]
         # Broadcasting them results in a [N, N] matrix of pairwise label comparisons.
         labels_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
-
-        print("labels_matrix")
-        print(labels_matrix)
 
         # 3. Discard self-similarity from positives
         # We create a mask to remove the diagonal (where an embedding is compared to itself)
@@ -299,40 +265,39 @@ def _(nn, torch):
         loss = loss[num_positives_per_row > 0].mean()
 
         return loss
-    return (supervised_contrastive_loss,)
+    return
 
 
 @app.cell
-def _(
-    CoordinateRotaryEmbedding3D,
-    DataLoader,
-    PrismOrderingDataset,
-    SaimeseEncoder,
-    torch,
-):
+def _(DataLoader, PosEmbedding3D, PrismOrderingDataset, SaimeseEncoder, torch):
+    METADATA_PATH = '/cbica/home/gangarav/data_25_processed/zarr_stats.parquet'
+
+    # --- Configuration ---
     METADATA_PATH = '/cbica/home/gangarav/data_25_processed/zarr_stats.parquet'
 
     # Data parameters (MUST match between dataset and model)
     PATCH_SHAPE = (1, 16, 16) # (Depth, Height, Width) of each patch
-    N_PATCHES = 100            # Number of patches to sample from each scan
+    N_PATCHES = 64            # Number of patches to sample from each scan
 
-    NUM_WORKERS = 1
+    #
+    NUM_WORKERS = 0
 
     # Model hyperparameters
     NUM_CLASSES = 3           # e.g., bleed vs. no_bleed
     MODEL_DIM = 288           # Main dimension of the transformer
-    TRANSFORMER_DEPTH = 8     # Number of transformer blocks
-    TRANSFORMER_HEADS = 8     # Number of attention heads
+    TRANSFORMER_DEPTH = 12     # Number of transformer blocks
+    TRANSFORMER_HEADS = 12     # Number of attention heads
     MLP_DIM = 512             # Hidden dimension in the FeedForward network
+    REGISTER_COUNT = 8
 
     # Training parameters
-    BATCH_SIZE = 256
+    BATCH_SIZE = 2
 
     # Check if a GPU is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    coordinate_encoder = CoordinateRotaryEmbedding3D(MODEL_DIM//2, max_freq = 50)
+    coordinate_encoder = PosEmbedding3D(MODEL_DIM//2, max_freq = 3)
 
     dataset = PrismOrderingDataset(
         metadata=METADATA_PATH,
@@ -345,70 +310,63 @@ def _(
         batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS, # Use 2 worker processes to load data in parallel
         persistent_workers=(NUM_WORKERS > 0),
+        pin_memory=True,
     )
-
-    # --- Setup Model ---
-
-    # model = SaimeseEncoder(
-    #     patch_size=PATCH_SHAPE,
-    #     num_classes=NUM_CLASSES,
-    #     dim=MODEL_DIM,
-    #     depth=TRANSFORMER_DEPTH,
-    #     heads=TRANSFORMER_HEADS,
-    #     mlp_dim=MLP_DIM,
-    #     use_rotary=True 
-    # ).to(device)
 
     model = SaimeseEncoder(
-        patch_size=(1, 16, 16),
-        num_classes=3,
-        register_count=8,
-        dim=288,
-        depth=8,
-        heads=8,
-        mlp_dim=512,
-        use_rotary=True
-    )
+        patch_size=PATCH_SHAPE,
+        register_count=REGISTER_COUNT,
+        num_classes=NUM_CLASSES,
+        dim=MODEL_DIM,
+        depth=TRANSFORMER_DEPTH,
+        heads=TRANSFORMER_HEADS,
+        mlp_dim=MLP_DIM,
+        use_rotary=True 
+    ).to(device)
 
-    model.load_state_dict(torch.load("/gpfs/fs001/cbica/home/gangarav/rsna25/trained_models/MIM_log_1754950863.csv_s_50000.pth", map_location='cpu'))
+    model.load_state_dict(torch.load("/gpfs/fs001/cbica/home/gangarav/rsna25/FULL_trained_models/MIM_log_1755306791.csv_s_20000.pth", map_location='cpu'))
     model.eval()
 
     data_iterator = iter(dataloader)
-    return coordinate_encoder, data_iterator, model
+    return REGISTER_COUNT, coordinate_encoder, data_iterator, device, model
 
 
 @app.cell
 def _(data_iterator):
-    patches_1, patches_2, idx_1, idx_2, scan, y, subset_1_start, subset_1_shape, subset_2_start, subset_2_shape = next(data_iterator)
-    return (
-        idx_1,
-        idx_2,
-        patches_1,
-        patches_2,
-        scan,
-        subset_1_shape,
-        subset_1_start,
-        subset_2_shape,
-        subset_2_start,
-    )
+    patches_1, patches_2, idx_1, idx_2, scan, y, sample_1, sample_2 = next(data_iterator)
+    return idx_1, idx_2, patches_1, patches_2
+
+
+@app.cell
+def _(label_patches_1, mim_prediction_1, mo):
+    mo.vstack([
+        mo.hstack([
+            mo.vstack([
+                mo.image(src=mim_prediction_1[_j,_i,0].cpu().detach().numpy(), width=32),
+                mo.image(src=label_patches_1[_j,_i,0].cpu().detach().numpy(), width=32)
+            ]) for _i in range(13)
+        ]) for _j in range (2)
+    ])
+    return
+
+
+@app.cell
+def _(pos_prediction):
+    pos_prediction
+    return
 
 
 @app.cell
 def _(
+    REGISTER_COUNT,
     coordinate_encoder,
+    device,
     idx_1,
     idx_2,
     interleave_tensors,
     model,
-    nn,
     patches_1,
     patches_2,
-    scan,
-    subset_1_shape,
-    subset_1_start,
-    subset_2_shape,
-    subset_2_start,
-    supervised_contrastive_loss,
     torch,
 ):
     split_size = 50
@@ -423,58 +381,41 @@ def _(
     input_idx_2 = idx_2[:,:split_size]
     label_idx_2 = idx_2[:,split_size:]
 
-    x1 = model.branch(input_patches_1, input_idx_1)
-    x2 = model.branch(input_patches_2, input_idx_2)
+    # Move data to the selected device (GPU or CPU)
+    input_patches_1 = input_patches_1.to(device, non_blocking=True)
+    input_patches_2 = input_patches_2.to(device, non_blocking=True)
+    input_idx_1 = input_idx_1.to(device, non_blocking=True)
+    input_idx_2 = input_idx_2.to(device, non_blocking=True)
+    label_patches_1 = label_patches_1.to(device, non_blocking=True)
+    label_patches_2 = label_patches_2.to(device, non_blocking=True)
+    label_idx_1 = label_idx_1.to(device, non_blocking=True)
+    label_idx_2 = label_idx_2.to(device, non_blocking=True)
+    # row_id = scan.to(device, non_blocking=True)
 
-    fused_scan_cls = torch.cat((x1[:, 0], x2[:, 0]), dim = 0)
-    fused_scan_cls = nn.functional.normalize(fused_scan_cls, p=2, dim=1)
-    fused_scan_y = torch.cat((scan, scan), dim = 0)
+    # y_class = (y > 0).to(torch.float32)
 
-    fused_pos_cls = torch.cat((x1[:, 1], x2[:, 1]), dim = 0)
-    fused_subset_start = torch.cat((
-        torch.stack(subset_1_start).T,
-        torch.stack(subset_2_start).T
-    ), dim=0)
-    fused_subset_shape = torch.cat((
-        torch.stack(subset_1_shape).T,
-        torch.stack(subset_2_shape).T
-    ), dim=0)
-    total_loss = supervised_contrastive_loss(fused_scan_cls, fused_scan_y)
+
+    # Forward pass
+    x1, x2 = model(input_patches_1, input_idx_1, input_patches_2, input_idx_2)
+
+    # fused_scan_cls = torch.cat((x1[:, 0], x2[:, 0]), dim = 0)
+    # fused_scan_cls = nn.functional.normalize(fused_scan_cls, p=2, dim=1)
+    # fused_scan_y = torch.cat((scan, scan), dim = 0)
+
+    # scan_loss = supervised_contrastive_loss(fused_scan_cls, fused_scan_y)
+
+    fused_pos_cls = torch.cat((x1[:, 1], x2[:, 1]), dim=1)
+    pos_prediction = model.trunk(fused_pos_cls)
 
     mim_prediction_1 = model.mim(
         interleave_tensors(coordinate_encoder(label_idx_1)),
-        torch.cat((x1[:, :2], x1[:,2+8:]), dim=1)
+        torch.cat((x1[:, :2], x1[:,2+REGISTER_COUNT:]), dim=1)
     )
     mim_prediction_2 = model.mim(
         interleave_tensors(coordinate_encoder(label_idx_2)),
-        torch.cat((x2[:, :2], x2[:,2+8:]), dim=1)
+        torch.cat((x2[:, :2], x2[:,2+REGISTER_COUNT:]), dim=1)
     )
-    return (
-        fused_pos_cls,
-        fused_scan_cls,
-        fused_scan_y,
-        fused_subset_shape,
-        fused_subset_start,
-        mim_prediction_1,
-        total_loss,
-    )
-
-
-@app.cell
-def _(fused_scan_cls, mo, np):
-    mo.image(src=np.array((fused_scan_cls @ fused_scan_cls.t()).detach()))
-    return
-
-
-@app.cell
-def _(total_loss):
-    total_loss
-    return
-
-
-@app.cell
-def _():
-    return
+    return fused_pos_cls, label_patches_1, mim_prediction_1, pos_prediction
 
 
 @app.cell
@@ -591,19 +532,6 @@ def _(chart_pca, mo, zarr_scan):
         )
 
     mo.image(src=_z[int(_scan_start[0] + 0.5*_scan_shape[0])])
-    return
-
-
-@app.cell
-def _(mim_prediction_1, mo):
-    mo.vstack([
-        mo.hstack([
-            mo.vstack([
-                mo.image(src=mim_prediction_1[_j,_i,0].detach().numpy(), width=32),
-                # mo.image(src=label_patches_1[_j,_i,0].detach().numpy(), width=32)
-            ]) for _i in range(25)
-        ]) for _j in range (128)
-    ])
     return
 
 

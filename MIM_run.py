@@ -8,7 +8,7 @@ app = marimo.App(width="medium")
 def _():
     from data_loader import zarr_scan
     from torch.utils.data import DataLoader, IterableDataset
-    from rvt_model import RvT, CoordinateRotaryEmbedding3D
+    from rvt_model import RvT, PosEmbedding3D
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, IterableDataset
@@ -21,10 +21,10 @@ def _():
     import time
     import zarr
     return (
-        CoordinateRotaryEmbedding3D,
         CrossAttender,
         DataLoader,
         IterableDataset,
+        PosEmbedding3D,
         RvT,
         nn,
         np,
@@ -39,86 +39,65 @@ def _():
 
 @app.cell
 def _(IterableDataset, np, pd, random, torch, zarr_scan):
-    def normalize_hu_to_range(hu_array, w_min, w_max, out_range=(-1.0, 1.0)):
-        clipped_array = np.clip(hu_array, w_min, w_max)
-        scaled_01 = (clipped_array - w_min) / (w_max - w_min)
-        out_min, out_max = out_range
-        return scaled_01 * (out_max - out_min) + out_min
-
-    def get_random_clamping_range(median, stdev):
-        lower_bound = median - 3 * stdev
-        upper_bound = median + 3 * stdev
-        if lower_bound >= upper_bound:
-            return lower_bound, upper_bound
-        point1 = np.random.uniform(lower_bound, upper_bound)
-        point2 = np.random.uniform(lower_bound, upper_bound)
-        return min(point1, point2), max(point1, point2)
-
     class PrismOrderingDataset(IterableDataset):
 
-        def __init__(self, metadata, patch_shape, n_patches):
+        def __init__(self, metadata, patch_shape, n_patches, n_sampled_from_same_study=8):
             super().__init__()
-            self.metadata = pd.read_parquet('/cbica/home/gangarav/data_25_processed/zarr_stats.parquet').head(3250)
+            stats_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/zarr_stats.parquet')
+            og_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/metadata.parquet')
+            merged_df = pd.merge(
+                og_pd,
+                stats_pd,
+                on='zarr_path',
+                how='left'
+            )
+            self.metadata = merged_df.head(500)
+
             self.patch_shape = patch_shape
             self.n_patches = n_patches
-            self.n_sampled_from_same_study = 4
+            self.n_sampled_from_same_study = n_sampled_from_same_study
 
         def __iter__(self):
-            # The __iter__ method is called once per worker process.
-            # We need to handle seeding properly for multiprocessing.
             worker_info = torch.utils.data.get_worker_info()
+            worker_id = worker_info.id if worker_info else 0 # Get worker ID
 
-            # If in a worker process, we need to re-seed to ensure each worker
-            # generates a different stream of random data.
             if worker_info is not None:
-
                 seed = (torch.initial_seed() + worker_info.id) % (2**32)
-
-                # This print statement might still not appear depending on your OS/IDE,
-                # but the seeding logic below is now correct.
-                print(f"Worker {worker_info.id} is using seed: {seed}", flush=True)
-
                 np.random.seed(seed)
                 random.seed(seed)
 
             while True:
-
+                print(f"[Worker {worker_id}] Sampling a study...")
                 sample = self.metadata.sample(n=1)
+                zarr_name = sample["zarr_path"].values[0]
+                print(f"[Worker {worker_id}] Selected scan: {zarr_name}")
 
                 row_id = sample.index.values[0]
-                zarr_name = sample["zarr_path"].values[0]
                 median = sample["median"].values[0]
                 stdev = sample["stdev"].values[0]
 
-                scan = zarr_scan(path_to_scan=zarr_name)
+                # 2. Instantiate the scan loader with all necessary info
+                try:
+                    scan = zarr_scan(
+                        path_to_scan=zarr_name,
+                        median=median,
+                        stdev=stdev,
+                        patch_shape=self.patch_shape
+                    )
+                except (ValueError, FileNotFoundError) as e:
+                    print(f"[Worker {worker_id}] CRITICAL: Skipping scan {zarr_name} due to error: {e}")
+                    continue
 
-                for i in range(self.n_sampled_from_same_study):
 
-                    r_wc, r_ww = scan.get_random_wc_ww_for_scan_median_stdev(median, stdev)
+                print(f"[Worker {worker_id}] Generating pairs for {zarr_name}...")
+                for _ in range(self.n_sampled_from_same_study):
+                    patches_1, patches_2, coords_1, coords_2, label, sample_1, sample_2 = scan.generate_training_pair(
+                        n_patches=self.n_patches,
+                        to_torch=True
+                    )
 
-                    subset_1_start, subset_1_shape = scan.get_random_subset_from_scan()
-                    idxs_1 = scan.get_random_patch_indices_from_scan_subset(subset_1_start, subset_1_shape, self.n_patches)
-                    patches_1 = normalize_hu_to_range(scan.get_patches_from_indices(idxs_1), r_wc - 0.5*r_ww, r_wc + 0.5*r_ww)
-                    patches_1_pt_space = scan.convert_indices_to_patient_space(idxs_1)
-                    subset_1_center = np.array(subset_1_start) + 0.5*np.array(subset_1_shape)
-                    subset_1_center = subset_1_center.astype(int)[np.newaxis, :]
-                    subset_1_center_pt_space = scan.convert_indices_to_patient_space(subset_1_center)
-
-                    subset_2_start, subset_2_shape = scan.get_random_subset_from_scan()
-                    idxs_2 = scan.get_random_patch_indices_from_scan_subset(subset_2_start, subset_2_shape, self.n_patches)
-                    patches_2 = normalize_hu_to_range(scan.get_patches_from_indices(idxs_2), r_wc - 0.5*r_ww, r_wc + 0.5*r_ww)
-                    patches_2_pt_space = scan.convert_indices_to_patient_space(idxs_2)
-                    subset_2_center = np.array(subset_2_start) + 0.5*np.array(subset_2_shape)
-                    subset_2_center = subset_2_center.astype(int)[np.newaxis, :]
-                    subset_2_center_pt_space = scan.convert_indices_to_patient_space(subset_2_center)
-
-                    patches_1_torch = torch.from_numpy(patches_1).to(torch.float32)
-                    patches_2_torch = torch.from_numpy(patches_2).to(torch.float32)
-                    idx_pt_space_1_torch = torch.from_numpy(patches_1_pt_space).to(torch.float32)
-                    idx_pt_space_2_torch = torch.from_numpy(patches_2_pt_space).to(torch.float32)
-                    label = torch.tensor(subset_2_center_pt_space - subset_1_center_pt_space, dtype=torch.float32)
-
-                    yield patches_1_torch, patches_2_torch, idx_pt_space_1_torch, idx_pt_space_2_torch, row_id, label
+                    print(f"[Worker {worker_id}] Yielding a training sample.")
+                    yield patches_1, patches_2, coords_1, coords_2, row_id, label
     return (PrismOrderingDataset,)
 
 
@@ -251,24 +230,23 @@ def _(nn, torch):
         loss = loss[num_positives_per_row > 0].mean()
 
         return loss
-    return (supervised_contrastive_loss,)
+    return
 
 
 @app.cell
 def _(
-    CoordinateRotaryEmbedding3D,
     DataLoader,
+    PosEmbedding3D,
     PrismOrderingDataset,
     SaimeseEncoder,
     interleave_tensors,
     nn,
     os,
-    supervised_contrastive_loss,
     time,
     torch,
 ):
     def train_model():
-        OUTPUT_DIR = "trained_models"
+        OUTPUT_DIR = "FULL_trained_models"
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
         # --- Configuration ---
@@ -276,21 +254,21 @@ def _(
 
         # Data parameters (MUST match between dataset and model)
         PATCH_SHAPE = (1, 16, 16) # (Depth, Height, Width) of each patch
-        N_PATCHES = 100            # Number of patches to sample from each scan
+        N_PATCHES = 64            # Number of patches to sample from each scan
 
         #
-        NUM_WORKERS = 2
+        NUM_WORKERS = 16
 
         # Model hyperparameters
         NUM_CLASSES = 3           # e.g., bleed vs. no_bleed
         MODEL_DIM = 288           # Main dimension of the transformer
-        TRANSFORMER_DEPTH = 8     # Number of transformer blocks
-        TRANSFORMER_HEADS = 8     # Number of attention heads
+        TRANSFORMER_DEPTH = 12     # Number of transformer blocks
+        TRANSFORMER_HEADS = 12     # Number of attention heads
         MLP_DIM = 512             # Hidden dimension in the FeedForward network
         REGISTER_COUNT = 8
 
         # Training parameters
-        BATCH_SIZE = 32
+        BATCH_SIZE = 128
         LEARNING_RATE = 1e-4
         TRAINING_STEPS = 100000 # Since the dataset is infinite, we train for a fixed number of steps
 
@@ -333,11 +311,11 @@ def _(
             use_rotary=True 
         ).to(device)
 
-        coordinate_encoder = CoordinateRotaryEmbedding3D(MODEL_DIM//2, max_freq = 50)
+        coordinate_encoder = PosEmbedding3D(MODEL_DIM//2, max_freq = 3)
 
         # --- Setup Optimizer and Loss Function ---
         optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-        position_criterion = nn.MSELoss()
+        position_criterion = nn.BCEWithLogitsLoss() 
         mim_loss = nn.SmoothL1Loss()
 
         # --- Training Loop ---
@@ -349,6 +327,7 @@ def _(
         for step in range(TRAINING_STEPS):
             try:
                 patches_1, patches_2, idx_1, idx_2, scan, y = next(data_iterator)
+                print(f"======={step}======")
 
                 # Split patches and indices for input vs label
                 split_size = 50
@@ -375,21 +354,23 @@ def _(
                 scan = scan.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True).squeeze(1)
 
+                y_class = (y > 0).to(torch.float32)
+
                 # 3. Standard training steps
                 optimizer.zero_grad()
 
                 # Forward pass
                 x1, x2 = model(input_patches_1, input_idx_1, input_patches_2, input_idx_2)
 
-                fused_scan_cls = torch.cat((x1[:, 0], x2[:, 0]), dim = 0)
-                fused_scan_cls = nn.functional.normalize(fused_scan_cls, p=2, dim=1)
-                fused_scan_y = torch.cat((scan, scan), dim = 0)
+                # fused_scan_cls = torch.cat((x1[:, 0], x2[:, 0]), dim = 0)
+                # fused_scan_cls = nn.functional.normalize(fused_scan_cls, p=2, dim=1)
+                # fused_scan_y = torch.cat((scan, scan), dim = 0)
 
-                scan_loss = supervised_contrastive_loss(fused_scan_cls, fused_scan_y)
+                # scan_loss = supervised_contrastive_loss(fused_scan_cls, fused_scan_y)
 
                 fused_pos_cls = torch.cat((x1[:, 1], x2[:, 1]), dim=1)
                 pos_prediction = model.trunk(fused_pos_cls)
-                pos_loss = position_criterion(pos_prediction, y)
+                pos_loss = position_criterion(pos_prediction, y_class)
 
                 mim_prediction_1 = model.mim(
                     interleave_tensors(coordinate_encoder(label_idx_1)),
@@ -403,7 +384,7 @@ def _(
                 mim_1_loss = mim_loss(mim_prediction_1, label_patches_1)
                 mim_2_loss = mim_loss(mim_prediction_2, label_patches_2)
 
-                total_loss = scan_loss + 10.0 * (mim_1_loss + mim_2_loss + pos_loss)
+                total_loss = mim_1_loss + mim_2_loss + pos_loss
 
                 # Backward pass and optimization
                 total_loss.backward()
@@ -420,15 +401,15 @@ def _(
                           f"Total Loss: {total_loss_item:.4f}, "
                           f"POS Loss: {pos_loss.item():.4f}, "
                           f"MIM1 Loss: {mim_1_loss.item():.4f}, "
-                          f"MIM2 Loss: {mim_2_loss.item():.4f}, "
-                          f"SCAN Loss: {scan_loss.item():.4f}")
+                          f"MIM2 Loss: {mim_2_loss.item():.4f}") #, "
+                          # f"SCAN Loss: {scan_loss.item():.4f}")
 
                     # Log all three loss values for better analysis later
                     with open(log_filename, 'a') as log_file:
-                        log_file.write(f"{step+1},{timestamp},{total_loss_item:.4f},{pos_loss.item():.4f},{mim_1_loss.item():.4f},{mim_2_loss.item():.4f},{scan_loss.item():.4f}\n")
+                        log_file.write(f"{step+1},{timestamp},{total_loss_item:.4f},{pos_loss.item():.4f},{mim_1_loss.item():.4f},{mim_2_loss.item():.4f}\n")
 
                 # Interim Checkpoint Saving
-                if (step + 1) % 2500 == 0:
+                if (step + 1) % 10000 == 0:
                     # Define a unique filename for the checkpoint
                     checkpoint_path = os.path.join(OUTPUT_DIR, f"MIM_{log_filename}_s_{step+1}.pth")
 
@@ -453,11 +434,6 @@ def _(
 @app.cell
 def _(train_model):
     train_model()
-    return
-
-
-@app.cell
-def _():
     return
 
 
