@@ -119,6 +119,11 @@ def _(patch_shape, sample, scan):
     return scan_pixels, slider
 
 
+@app.cell
+def _():
+    return
+
+
 @app.class_definition
 class zarr_scan():
 
@@ -128,35 +133,46 @@ class zarr_scan():
         self.med = median
         self.std = stdev
 
-    def generate_training_pair(self, n_patches: int, to_torch: bool = True) -> tuple:
-        """
-        A high-level helper for training loops that generates a pair of samples.
-        """
+    # def generate_training_pair(self, n_patches: int, to_torch: bool = True) -> tuple:
+    #     """
+    #     A high-level helper for training loops that generates a pair of samples.
+    #     """
 
-        wc, ww = self.get_random_wc_ww_for_scan()
-        sample_1_data = self.train_sample(n_patches=n_patches, wc=wc, ww=ww)
-        sample_2_data = self.train_sample(n_patches=n_patches, wc=wc, ww=ww)
+    #     wc1, ww1 = self.get_random_wc_ww_for_scan()
+    #     wc2, ww2 = self.get_random_wc_ww_for_scan()
+    #     sample_1_data = self.train_sample(n_patches=n_patches, wc=wc1, ww=ww1)
+    #     sample_2_data = self.train_sample(n_patches=n_patches, wc=wc2, ww=ww2)
 
-        patches_1 = sample_1_data['normalized_patches']
-        patches_2 = sample_2_data['normalized_patches']
-        patch_coords_1 = sample_1_data['patch_centers_pt'] - sample_1_data['subset_center_pt']
-        patch_coords_2 = sample_2_data['patch_centers_pt'] - sample_2_data['subset_center_pt']
+    #     patches_1 = sample_1_data['normalized_patches']
+    #     patches_2 = sample_2_data['normalized_patches']
+    #     patch_coords_1 = sample_1_data['patch_centers_pt'] - sample_1_data['subset_center_pt']
+    #     patch_coords_2 = sample_2_data['patch_centers_pt'] - sample_2_data['subset_center_pt']
 
-        label = sample_2_data['subset_center_pt'] - sample_1_data['subset_center_pt']
-        label = label.squeeze(0)
+    #     print(wc1, wc2)
+    #     print(ww1, ww2)
 
-        if to_torch:
-            patches_1 = torch.from_numpy(patches_1).to(torch.float32)
-            patches_2 = torch.from_numpy(patches_2).to(torch.float32)
-            patch_coords_1 = torch.from_numpy(patch_coords_1).to(torch.float32)
-            patch_coords_2 = torch.from_numpy(patch_coords_2).to(torch.float32)
-            label = torch.from_numpy(label).to(torch.float32)
+    #     # position based relative view information
+    #     pos_label = sample_2_data['subset_center_pt'] - sample_1_data['subset_center_pt']
+    #     pos_label = pos_label.squeeze(0)
 
-        return patches_1, patches_2, patch_coords_1, patch_coords_2, label
+    #     # window based relative view information
+    #     window_label = np.array([wc2 - wc1, ww2 - ww1])
+
+    #     label = np.concatenate((pos_label, window_label))
+
+    #     if to_torch:
+    #         patches_1 = torch.from_numpy(patches_1).to(torch.float32)
+    #         patches_2 = torch.from_numpy(patches_2).to(torch.float32)
+    #         patch_coords_1 = torch.from_numpy(patch_coords_1).to(torch.float32)
+    #         patch_coords_2 = torch.from_numpy(patch_coords_2).to(torch.float32)
+    #         label = torch.from_numpy(label).to(torch.float32)
+
+    #     return patches_1, patches_2, patch_coords_1, patch_coords_2, label
 
     def train_sample(
         self,
         n_patches: int,
+        patch_jitter: float = 0.33,
         *, # Force subsequent arguments to be keyword-only for clarity
         subset_start: Optional[Tuple[int, int, int]] = None,
         subset_shape: Optional[Tuple[int, int, int]] = None,
@@ -181,7 +197,7 @@ class zarr_scan():
             results['subset_start'], results['subset_shape'] = subset_start, subset_shape
 
             patch_indices = self.get_stratified_random_patch_indices(
-                subset_start, subset_shape, n_patches
+                subset_start, subset_shape, n_patches, patch_jitter
             )
             results['patch_indices'] = patch_indices
 
@@ -260,7 +276,7 @@ class zarr_scan():
         return rgb_volume
 
     def get_random_wc_ww_for_scan(self):
-        return random.uniform(self.med-self.std, self.med+self.std), random.uniform(self.std, 6*self.std)
+        return random.uniform(self.med-self.std, self.med+self.std), random.uniform(2*self.std, 6*self.std)
 
     def normalize_pixels_to_range(self, pixel_array, w_min, w_max, out_range=(-1.0, 1.0)):
         # Ensure w_max is greater than w_min to avoid division by zero
@@ -358,7 +374,6 @@ class zarr_scan():
                                             subset_start, 
                                             subset_shape, 
                                             n_patches, 
-                                            grid_density_factor=1.0, 
                                             randomness_factor=0.33):
         """
         Generates patch start indices using a stratified sampling approach.
@@ -373,10 +388,6 @@ class zarr_scan():
             subset_shape (tuple or list): The (d, r, c) shape of the subset from 
                                           which to sample.
             n_patches (int): The total number of patches to sample.
-            grid_density_factor (float): Adjusts the density of the sampling grid.
-                - 1.0: The volume of each grid cell is roughly `subset_volume / n_patches`.
-                - > 1.0: More, smaller grid cells. Increases stratification.
-                - < 1.0: Fewer, larger grid cells. Approaches pure random sampling.
             randomness_factor (float): Controls the jitter of the patch start relative
                                      to its grid cell center.
                 - 0.0: The patch is perfectly centered within its random offset.
@@ -417,11 +428,6 @@ class zarr_scan():
         zz, yy, xx = np.meshgrid(grid_centers_d, grid_centers_r, grid_centers_c, indexing='ij')
         all_grid_centers = np.vstack([zz.ravel(), yy.ravel(), xx.ravel()]).T
 
-        # --- 3. Sample Grid Centers with Replacement ---
-        # This is the "cleaner" way to handle the probabilistic selection. Instead
-        # of looping with a certain probability, we simply draw n_patches samples
-        # from the list of all centers. `replace=True` allows a center to be
-        # chosen multiple times, achieving your desired outcome.
         n_total_centers = len(all_grid_centers)
         if n_total_centers == 0:
             return np.empty((0, 3), dtype=int)
@@ -446,19 +452,30 @@ class zarr_scan():
         patch_half_shape[0] = 0
         relative_starts = (sampled_centers + random_offsets) - patch_half_shape
 
-        # --- 5. Clamp Patch Starts to Valid Subset Boundaries ---
-        # Ensure the patch does not go outside the subset dimensions.
-        max_patch_start = np.array(subset_shape) - np.array(self.patch_shape)
-        # Ensure max start is not negative (if subset is smaller than patch)
-        max_patch_start = np.maximum(0, max_patch_start)
+        ### NEW
 
-        # np.clip is perfect for this clamping operation
-        clamped_relative_starts = np.clip(relative_starts, 0, max_patch_start)
+        unclamped_absolute_starts = np.array(subset_start) + relative_starts
+        max_scan_start = np.array(self.zarr_store["pixel_data"].shape) - np.array(self.patch_shape)
+        max_scan_start = np.maximum(0, max_scan_start) # Ensure it's not negative
+        clamped_absolute_starts = np.clip(unclamped_absolute_starts, 0, max_scan_start)
 
-        # --- 6. Convert to Absolute Coordinates and Return ---
-        absolute_starts = (np.array(subset_start) + clamped_relative_starts).astype(int)
+        return clamped_absolute_starts.astype(int)
 
-        return absolute_starts
+        ### END NEW
+
+        # # --- 5. Clamp Patch Starts to Valid Subset Boundaries ---
+        # # Ensure the patch does not go outside the subset dimensions.
+        # max_patch_start = np.array(subset_shape) - np.array(self.patch_shape)
+        # # Ensure max start is not negative (if subset is smaller than patch)
+        # max_patch_start = np.maximum(0, max_patch_start)
+
+        # # np.clip is perfect for this clamping operation
+        # clamped_relative_starts = np.clip(relative_starts, 0, max_patch_start)
+
+        # # --- 6. Convert to Absolute Coordinates and Return ---
+        # absolute_starts = (np.array(subset_start) + clamped_relative_starts).astype(int)
+
+        # return absolute_starts
 
 
     def get_true_random_patch_indices_from_scan_subset(self, subset_start, subset_shape, n_patches):
