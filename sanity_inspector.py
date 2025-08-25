@@ -7,10 +7,16 @@ app = marimo.App(width="medium")
 @app.cell
 def _():
     import marimo as mo
+    import wandb
+    import sys
     import os
+    import shutil
     import torch
     from torch import optim, nn, utils, Tensor
+    from torchvision.datasets import MNIST
+    from torchvision.transforms import ToTensor
     import lightning as L
+    from pytorch_lightning.loggers import WandbLogger
     from lightning.pytorch.callbacks import ModelCheckpoint
     from rvt_model import RvT, PosEmbedding3D
     from torch.utils.data import DataLoader, IterableDataset
@@ -19,240 +25,233 @@ def _():
     import pandas as pd
     import numpy as np
     import random
-
-    return (
-        DataLoader,
-        IterableDataset,
-        L,
-        RvT,
-        mo,
-        nn,
-        optim,
-        os,
-        pd,
-        torch,
-        zarr_scan,
-    )
+    import time
+    from sklearn.decomposition import PCA
+    import matplotlib.pyplot as plt
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import adjusted_rand_score
+    from lightning_train import PrismOrderingDataset
+    return PrismOrderingDataset, mo, os, torch, zarr_scan
 
 
 @app.cell
-def _(L, RvT, nn, optim, torch):
-    class RadiographyEncoder(L.LightningModule):
-        def __init__(
-            self, *,
-            # model hyperparameters
-            encoder_dim,
-            encoder_depth,
-            encoder_heads,
-            mlp_dim,
-            n_registers,
-            use_rotary,
-            # training runtime hyperparameters
-            batch_size,
-            learning_rate,
-            # dataset hyperparameters
-            patch_size,
-            patch_jitter,
-            # objectives
-        ):
-            #view objectives refer to:
-            #  x, y, z axes
-            #  (window width, window center)
-            #  (zoom scale, rotation x, y, z)
-            NUM_VIEW_OBJECTIVES = 3
-            self.n_registers=n_registers
+def _(PrismOrderingDataset):
+    PATCH_SHAPE = (1, 16, 16)
+    N_PATCHES = 64
+    METADATA_PATH = '/cbica/home/gangarav/data_25_processed/metadata.parquet'
+    scratch_dir = "/scratch/gangarav/"
 
-            super().__init__()
-
-            self.save_hyperparameters()
-            self.encoder = RvT(
-                patch_size=patch_size,
-                register_count=n_registers,
-                dim=encoder_dim,
-                depth=encoder_depth,
-                heads=encoder_heads,
-                mlp_dim=mlp_dim,
-                use_rotary=use_rotary
-            )
-
-            # CAUTION: relative view head requires two concatenated
-            # encoder outputs because it calculates the relative
-            # difference* between the objectives
-            self.relative_view_head = nn.Sequential(
-                nn.LayerNorm(encoder_dim * 2),
-                nn.Linear(encoder_dim * 2, NUM_VIEW_OBJECTIVES)
-            )
-
-            self.view_criterion = nn.BCEWithLogitsLoss() 
-
-        def raw_encoder_emb_to_scan_view_registers_patches(self, emb):
-            # 0: global scan embedding
-            # 1: local view embedding
-            # 2 - 2+registers: register tokens
-            # 2+registers - end: patch embeddings
-            return emb[:, 0], emb[:, 1], emb[:, 2:2+self.n_registers], emb[:, 2+self.n_registers:]
-
-
-        def training_step(self, batch, batch_idx):
-            patches_1, patches_2, coords_1, coords_2, row_id, label = batch
-
-            # TODO: allow swapping view target between
-            # - regression versus classification task
-            # - patient space versus pixel space
-            view_target = (label > 0).to(torch.float32)
-
-            # TODO: allow swapping between
-            # - absolute versus relative position embedding
-            # - patient space versus pixel space
-            emb1 = self.encoder(patches_1, coords_1)
-            emb2 = self.encoder(patches_2, coords_2)
-
-            # scan_cls_1, view_cls_1, registers_1, patch_emb_1 = self.raw_encoder_emb_to_scan_view_registers_patches(emb1)
-            # scan_cls_2, view_cls_2, registers_2, patch_emb_2 = self.raw_encoder_emb_to_scan_view_registers_patches(emb2)
-
-            # TODO: allow specifying which objectives will be run
-
-            fused_view_cls = torch.cat((emb1[:, 1], emb2[:, 1]), dim=1)
-            view_prediction = self.relative_view_head(fused_view_cls)
-            loss = self.view_criterion(view_prediction, view_target)
-
-            print(view_prediction)
-
-        # def validation_step(self, batch, batch_idx):
-        #     # this is the validation loop
-        #     x, _ = batch
-        #     x = x.view(x.size(0), -1)
-        #     z = self.encoder(x)
-        #     x_hat = self.decoder(z)
-        #     val_loss = F.mse_loss(x_hat, x)
-        #     self.log("val_loss", val_loss)
-
-        def configure_optimizers(self):
-            # Use the learning_rate from hparams so it can be configured by sweeps
-            optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-            return optimizer
-    return (RadiographyEncoder,)
-
-
-@app.cell
-def _(
-    DataLoader,
-    IterableDataset,
-    pd,
-    source_zarr_path,
-    torch,
-    worker_id,
-    zarr_scan,
-):
-    class PrismOrderingDataset(IterableDataset):
-
-        def __init__(self, patch_shape, n_patches):
-            super().__init__()
-            stats_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/zarr_stats.parquet')
-            og_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/metadata.parquet')
-            merged_df = pd.merge(
-                og_pd,
-                stats_pd,
-                on='zarr_path',
-                how='left'
-            )
-            self.metadata = merged_df
-
-            self.patch_shape = patch_shape
-            self.n_patches = n_patches
-
-        def __iter__(self):
-
-            while True:
-
-                for _, sample in self.metadata.iterrows():
-
-                    path_to_load = sample["zarr_path"]
-                    row_id = sample.name
-                    median = sample["median"]
-                    stdev = sample["stdev"]
-
-                    # 2. Instantiate the scan loader with all necessary info
-                    try:
-                        scan = zarr_scan(
-                            path_to_scan=path_to_load,
-                            median=median,
-                            stdev=stdev,
-                            patch_shape=self.patch_shape
-                        )
-                    except (ValueError, FileNotFoundError) as e:
-                        print(f"[Worker {worker_id}] CRITICAL: Skipping scan {source_zarr_path} due to error: {e}")
-                        continue
-
-
-                    wc, ww = scan.get_random_wc_ww_for_scan()
-                    sample_1_data = scan.train_sample(n_patches=self.n_patches, wc=wc, ww=ww)
-                    sample_2_data = scan.train_sample(n_patches=self.n_patches, wc=wc, ww=ww)
-
-                    patches_1 = sample_1_data['normalized_patches']
-                    patches_2 = sample_2_data['normalized_patches']
-                    patch_coords_1 = sample_1_data['patch_centers_pt'] - sample_1_data['subset_center_pt']
-                    patch_coords_2 = sample_2_data['patch_centers_pt'] - sample_2_data['subset_center_pt']
-
-                    label = sample_2_data['subset_center_pt'] - sample_1_data['subset_center_pt']
-                    label = label.squeeze(0)
-
-                    patches_1 = torch.from_numpy(patches_1).to(torch.float32)
-                    patches_2 = torch.from_numpy(patches_2).to(torch.float32)
-                    patch_coords_1 = torch.from_numpy(patch_coords_1).to(torch.float32)
-                    patch_coords_2 = torch.from_numpy(patch_coords_2).to(torch.float32)
-                    label = torch.from_numpy(label).to(torch.float32)
-
-                    yield patches_1, patches_2, patch_coords_1, patch_coords_2, row_id, label, sample_1_data, sample_2_data, {"path_to_scan": path_to_load, "median": median, "stdev": stdev, "patch_shape": self.patch_shape}
-
-
-    # Data parameters (MUST match between dataset and model)
-    PATCH_SHAPE = (1, 16, 16) # (Depth, Height, Width) of each patch
-    N_PATCHES = 64            # Number of patches to sample from each scan
-
-    # setup data
     dataset = PrismOrderingDataset(
+        metadata=METADATA_PATH,
         patch_shape=PATCH_SHAPE,
         n_patches=N_PATCHES,
+        position_space='patient',
+        n_aux_patches=10,
+        scratch_dir=scratch_dir,
+        n_sampled_from_same_study=4
     )
-
-    NUM_WORKERS=0
-    dataloader = DataLoader(
-        dataset,
-        batch_size=1,
-        num_workers=NUM_WORKERS, # Use 2 worker processes to load data in parallel
-        persistent_workers=(NUM_WORKERS > 0),
-        pin_memory=True,
-    )
-
-    iterator = iter(dataloader)
-    # include a validation set
-    return (iterator,)
+    return (dataset,)
 
 
 @app.cell
-def _(mo):
+def _(dataset, mo):
+    table = mo.ui.table(dataset.metadata, selection='single')
+    table
+    return (table,)
+
+
+@app.cell
+def _(mo, table, zarr_scan):
+    row = table.value.iloc[0]
+    scan = zarr_scan(
+        path_to_scan=row["zarr_path"],
+        median=row["median"],
+        stdev=row["stdev"]
+    )
     run_btn = mo.ui.run_button(label="Run")
     run_btn
-    return (run_btn,)
+    return run_btn, scan
 
 
 @app.cell
-def _(iterator, run_btn):
+def _(dataset, run_btn, scan):
     if run_btn.value:
-        batch = next(iterator)
-        patches_1, patches_2, patch_coords_1, patch_coords_2, row_id, label, sample_1_data, sample_2_data, scan_metadata = batch
-    return (
-        label,
-        patch_coords_1,
-        patch_coords_2,
-        patches_1,
-        patches_2,
-        row_id,
-        sample_1_data,
-        sample_2_data,
-        scan_metadata,
+        batch, sample_1, sample_2, aux_1, aux_2 = dataset.generate_training_pair(
+            scan,
+            n_patches=8,
+            n_aux_patches=4,
+            position_space='pixel',
+            debug=True
+        )
+        batch
+    return aux_1, aux_2, batch, sample_1, sample_2
+
+
+@app.cell
+def _(sample_1):
+    sample_1
+    return
+
+
+@app.cell
+def _(aux_1, aux_2, batch, mo, sample_1, sample_2):
+    mo.vstack([
+        mo.md(f"patch 1 (shape, min, max) - {sample_1['subset_center_idx'][0]}"),
+        mo.hstack([batch[0].shape, round(batch[0].min().item(), 2), round(batch[0].max().item(), 2)], justify="start"),
+        batch[2],
+        mo.md(f"patch 2 (shape, min, max) - {sample_2['subset_center_idx'][0]}"),
+        mo.hstack([batch[1].shape, round(batch[1].min().item(), 2), round(batch[1].max().item(), 2)], justify="start"),
+        batch[3],
+        mo.md(f"aux 1 (shape, min, max) - {aux_1['subset_center_idx'][0]}"),
+        mo.hstack([batch[4].shape, round(batch[4].min().item(), 2), round(batch[4].max().item(), 2)], justify="start"),
+        batch[6],
+        mo.md(f"aux 2 (shape, min, max) - {aux_2['subset_center_idx'][0]}"),
+        mo.hstack([batch[5].shape, round(batch[5].min().item(), 2), round(batch[5].max().item(), 2)], justify="start"),
+        batch[7],
+    ])
+    return
+
+
+@app.cell
+def _(batch, mo, px, slider):
+    mo.hstack([
+        mo.image(src=px[slider.value]),
+        mo.vstack([
+            mo.md("Patches Sample 1"),
+            mo.hstack([mo.image(src=_patch[0], width=32, height=32) for _patch in batch[0]]),
+            mo.md("Patches Sample 2"),
+            mo.hstack([mo.image(src=_patch[0], width=32, height=32) for _patch in batch[1]]),
+            mo.md("Aux Sample 1"),
+            mo.hstack([mo.image(src=_patch[0], width=32, height=32) for _patch in batch[4]]),
+            mo.md("Aux Sample 2"),
+            mo.hstack([mo.image(src=_patch[0], width=32, height=32) for _patch in batch[5]]),
+        ])
+    ])
+    return
+
+
+@app.cell
+def _(aux_1, aux_2, mo, sample_1, sample_2, scan):
+    px = scan.get_scan_array_copy()
+
+    px = scan.create_rgb_scan_with_boxes(
+        px,
+        [sample_1["subset_start"]],
+        sample_1["subset_shape"],
+        color=(255, 0, 0)
     )
+
+    px = scan.create_rgb_scan_with_boxes(
+        px,
+        sample_1["patch_indices"],
+        [1, 16, 16],
+        color=(0, 255, 0)
+    )
+
+    px = scan.create_rgb_scan_with_boxes(
+        px,
+        [sample_2["subset_start"]],
+        sample_2["subset_shape"],
+        color=(0, 0, 255)
+    )
+
+    px = scan.create_rgb_scan_with_boxes(
+        px,
+        sample_2["patch_indices"],
+        [1, 16, 16],
+        color=(0, 255, 0)
+    )
+
+    px = scan.create_rgb_scan_with_boxes(
+        px,
+        [aux_1["subset_start"]],
+        aux_1["subset_shape"],
+        color=(255, 100, 100)
+    )
+
+    px = scan.create_rgb_scan_with_boxes(
+        px,
+        aux_1["patch_indices"],
+        [1, 16, 16],
+        color=(0, 255, 0)
+    )
+
+    px = scan.create_rgb_scan_with_boxes(
+        px,
+        [aux_2["subset_start"]],
+        aux_2["subset_shape"],
+        color=(100, 100, 255)
+    )
+
+    px = scan.create_rgb_scan_with_boxes(
+        px,
+        aux_2["patch_indices"],
+        [1, 16, 16],
+        color=(0, 255, 0)
+    )
+
+    slider = mo.ui.slider(steps=range(px.shape[0]), value=sample_1["subset_start"][0])
+    slider
+    return px, slider
+
+
+@app.cell
+def _():
+    # if run_btn.value:
+    #     batch = next(iterator)
+    #     patches_1, patches_2, patch_coords_1, patch_coords_2, aux_patches_1, aux_patches_2, aux_coords_1, aux_coords_2, label, row_id = batch
+    return
+
+
+@app.cell
+def _(scan_metadata):
+    scan_metadata
+    return
+
+
+@app.cell
+def _():
+    # scan_metadata = dataset.metadata.iloc[row_id]
+    # scan = zarr_scan(
+    #     path_to_scan=scan_metadata["zarr_path"],
+    #     median=scan_metadata["median"],
+    #     stdev=scan_metadata["stdev"],
+    # )
+
+    # px = scan.get_scan_array_copy()
+
+    # px = scan.create_rgb_scan_with_boxes(
+    #     px,
+    #     [patches_1],
+    #     torch.stack(sample_1_data["subset_shape"]).reshape(3).cpu().numpy().astype(int),
+    #     color=(255, 0, 0)
+    # )
+
+    # _px = _scan.create_rgb_scan_with_boxes(
+    #     _px,
+    #     sample_1_data["patch_indices"].squeeze(),
+    #     (1, 16, 16),
+    #     color=(0, 255, 0)
+    # )
+
+    # _px = _scan.create_rgb_scan_with_boxes(
+    #     _px,
+    #     [torch.stack(sample_2_data["subset_start"]).reshape(3).cpu().numpy().astype(int)],
+    #     torch.stack(sample_2_data["subset_shape"]).reshape(3).cpu().numpy().astype(int),
+    #     color=(255, 0, 0)
+    # )
+
+    # pox = _scan.create_rgb_scan_with_boxes(
+    #     _px,
+    #     sample_2_data["patch_indices"].squeeze(),
+    #     (1, 16, 16),
+    #     color=(0, 255, 0)
+    # )
+
+    # sloder = mo.ui.slider(start=0, stop=_px.shape[0]-1, value=sample_1_data["subset_center_idx"][0,0,0].item())
+    # sloder
+    # px = scan.get_scan_array_copy()
+    return
 
 
 @app.cell
@@ -265,11 +264,11 @@ def _(RadiographyEncoder, os, torch):
 
         # --- Step 4: Load the Model from the Checkpoint ---
         print(f"Loading model from checkpoint: {CHECKPOINT_PATH}")
-    
+
         # This is the magic command. It will automatically read the hyperparameters
         # saved in the .ckpt file and instantiate the model with them.
         model = RadiographyEncoder.load_from_checkpoint(checkpoint_path=CHECKPOINT_PATH)
-    
+
         model.eval()
 
         # Move model to GPU if available

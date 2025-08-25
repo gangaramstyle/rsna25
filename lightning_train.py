@@ -616,6 +616,7 @@ def train_run(default_config=None):
         max_epochs=-1, # For iterable datasets, steps are better than epochs
         max_steps=5000000, # Example: set a max number of steps
         callbacks=[checkpoint_callback],
+        accumulate_grad_batches=10,
         logger=wandb_logger,
         log_every_n_steps=25,
         val_check_interval=5000,
