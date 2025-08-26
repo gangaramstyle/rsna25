@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.14.17"
+__generated_with = "0.15.0"
 app = marimo.App(width="medium")
 
 
@@ -8,374 +8,405 @@ app = marimo.App(width="medium")
 def _():
     import marimo as mo
     import wandb
-    import sys
     import os
-    import shutil
     import torch
-    from torch import optim, nn, utils, Tensor
-    from torchvision.datasets import MNIST
-    from torchvision.transforms import ToTensor
-    import lightning as L
-    from pytorch_lightning.loggers import WandbLogger
-    from lightning.pytorch.callbacks import ModelCheckpoint
-    from rvt_model import RvT, PosEmbedding3D
-    from torch.utils.data import DataLoader, IterableDataset
-    from typing import Optional, Tuple, Dict, Any
-    from data_loader import zarr_scan
     import pandas as pd
     import numpy as np
-    import random
-    import time
     from sklearn.decomposition import PCA
-    import matplotlib.pyplot as plt
     from sklearn.cluster import KMeans
     from sklearn.metrics import adjusted_rand_score
-    from lightning_train import PrismOrderingDataset
-    return PrismOrderingDataset, mo, os, torch, zarr_scan
-
-
-@app.cell
-def _(PrismOrderingDataset):
-    PATCH_SHAPE = (1, 16, 16)
-    N_PATCHES = 64
-    METADATA_PATH = '/cbica/home/gangarav/data_25_processed/metadata.parquet'
-    scratch_dir = "/scratch/gangarav/"
-
-    dataset = PrismOrderingDataset(
-        metadata=METADATA_PATH,
-        patch_shape=PATCH_SHAPE,
-        n_patches=N_PATCHES,
-        position_space='patient',
-        n_aux_patches=10,
-        scratch_dir=scratch_dir,
-        n_sampled_from_same_study=4
-    )
-    return (dataset,)
-
-
-@app.cell
-def _(dataset, mo):
-    table = mo.ui.table(dataset.metadata, selection='single')
-    table
-    return (table,)
-
-
-@app.cell
-def _(mo, table, zarr_scan):
-    row = table.value.iloc[0]
-    scan = zarr_scan(
-        path_to_scan=row["zarr_path"],
-        median=row["median"],
-        stdev=row["stdev"]
-    )
-    run_btn = mo.ui.run_button(label="Run")
-    run_btn
-    return run_btn, scan
-
-
-@app.cell
-def _(dataset, run_btn, scan):
-    if run_btn.value:
-        batch, sample_1, sample_2, aux_1, aux_2 = dataset.generate_training_pair(
-            scan,
-            n_patches=8,
-            n_aux_patches=4,
-            position_space='pixel',
-            debug=True
-        )
-        batch
-    return aux_1, aux_2, batch, sample_1, sample_2
-
-
-@app.cell
-def _(sample_1):
-    sample_1
-    return
-
-
-@app.cell
-def _(aux_1, aux_2, batch, mo, sample_1, sample_2):
-    mo.vstack([
-        mo.md(f"patch 1 (shape, min, max) - {sample_1['subset_center_idx'][0]}"),
-        mo.hstack([batch[0].shape, round(batch[0].min().item(), 2), round(batch[0].max().item(), 2)], justify="start"),
-        batch[2],
-        mo.md(f"patch 2 (shape, min, max) - {sample_2['subset_center_idx'][0]}"),
-        mo.hstack([batch[1].shape, round(batch[1].min().item(), 2), round(batch[1].max().item(), 2)], justify="start"),
-        batch[3],
-        mo.md(f"aux 1 (shape, min, max) - {aux_1['subset_center_idx'][0]}"),
-        mo.hstack([batch[4].shape, round(batch[4].min().item(), 2), round(batch[4].max().item(), 2)], justify="start"),
-        batch[6],
-        mo.md(f"aux 2 (shape, min, max) - {aux_2['subset_center_idx'][0]}"),
-        mo.hstack([batch[5].shape, round(batch[5].min().item(), 2), round(batch[5].max().item(), 2)], justify="start"),
-        batch[7],
-    ])
-    return
-
-
-@app.cell
-def _(batch, mo, px, slider):
-    mo.hstack([
-        mo.image(src=px[slider.value]),
-        mo.vstack([
-            mo.md("Patches Sample 1"),
-            mo.hstack([mo.image(src=_patch[0], width=32, height=32) for _patch in batch[0]]),
-            mo.md("Patches Sample 2"),
-            mo.hstack([mo.image(src=_patch[0], width=32, height=32) for _patch in batch[1]]),
-            mo.md("Aux Sample 1"),
-            mo.hstack([mo.image(src=_patch[0], width=32, height=32) for _patch in batch[4]]),
-            mo.md("Aux Sample 2"),
-            mo.hstack([mo.image(src=_patch[0], width=32, height=32) for _patch in batch[5]]),
-        ])
-    ])
-    return
-
-
-@app.cell
-def _(aux_1, aux_2, mo, sample_1, sample_2, scan):
-    px = scan.get_scan_array_copy()
-
-    px = scan.create_rgb_scan_with_boxes(
-        px,
-        [sample_1["subset_start"]],
-        sample_1["subset_shape"],
-        color=(255, 0, 0)
+    from data_loader import zarr_scan
+    from lightning_train import RadiographyEncoder
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader, IterableDataset
+    import altair as alt
+    return (
+        DataLoader,
+        IterableDataset,
+        RadiographyEncoder,
+        alt,
+        mo,
+        np,
+        os,
+        pd,
+        torch,
+        zarr_scan,
     )
 
-    px = scan.create_rgb_scan_with_boxes(
-        px,
-        sample_1["patch_indices"],
-        [1, 16, 16],
-        color=(0, 255, 0)
+
+@app.cell
+def _(RadiographyEncoder, mo, os, torch):
+    mo.md("### 1. Load Model from `wandb` Run")
+
+    # Input for the user to provide the wandb Run ID
+    run_id_input = mo.ui.text(
+        value="rwibpui9", # A default value to start with
+        label="Enter `wandb` Run ID:"
     )
 
-    px = scan.create_rgb_scan_with_boxes(
-        px,
-        [sample_2["subset_start"]],
-        sample_2["subset_shape"],
-        color=(0, 0, 255)
-    )
+    def get_model(run_id):
+        """
+        Loads the RadiographyEncoder model from a specified checkpoint path.
+        """
+        if not run_id:
+            return None, "Please enter a valid wandb Run ID."
 
-    px = scan.create_rgb_scan_with_boxes(
-        px,
-        sample_2["patch_indices"],
-        [1, 16, 16],
-        color=(0, 255, 0)
-    )
+        # Construct the path to the checkpoint file
+        checkpoint_path = f"/cbica/home/gangarav/checkpoints/{run_id}/last.ckpt"
 
-    px = scan.create_rgb_scan_with_boxes(
-        px,
-        [aux_1["subset_start"]],
-        aux_1["subset_shape"],
-        color=(255, 100, 100)
-    )
+        if not os.path.exists(checkpoint_path):
+            return None, mo.md(f"**Error**: Checkpoint not found at `{checkpoint_path}`.")
 
-    px = scan.create_rgb_scan_with_boxes(
-        px,
-        aux_1["patch_indices"],
-        [1, 16, 16],
-        color=(0, 255, 0)
-    )
+        try:
+            # Load the model using the class method from the training script.
+            # Lightning automatically handles hyperparameters.
+            model = RadiographyEncoder.load_from_checkpoint(checkpoint_path=checkpoint_path)
+            model.eval()  # Set the model to evaluation mode
 
-    px = scan.create_rgb_scan_with_boxes(
-        px,
-        [aux_2["subset_start"]],
-        aux_2["subset_shape"],
-        color=(100, 100, 255)
-    )
+            # Move model to GPU if available, otherwise CPU
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model.to(device)
 
-    px = scan.create_rgb_scan_with_boxes(
-        px,
-        aux_2["patch_indices"],
-        [1, 16, 16],
-        color=(0, 255, 0)
-    )
+            status_message = mo.md(f"✅ Model from run `{run_id}` loaded successfully on `{device}`.")
+            return model, status_message
+        except Exception as e:
+            return None, mo.md(f"**Error**: Failed to load model. Reason: {e}")
 
-    slider = mo.ui.slider(steps=range(px.shape[0]), value=sample_1["subset_start"][0])
-    slider
-    return px, slider
+    # Display the input field
+    run_id_input
+    return get_model, run_id_input
 
 
 @app.cell
-def _():
-    # if run_btn.value:
-    #     batch = next(iterator)
-    #     patches_1, patches_2, patch_coords_1, patch_coords_2, aux_patches_1, aux_patches_2, aux_coords_1, aux_coords_2, label, row_id = batch
-    return
-
-
-@app.cell
-def _(scan_metadata):
-    scan_metadata
-    return
-
-
-@app.cell
-def _():
-    # scan_metadata = dataset.metadata.iloc[row_id]
-    # scan = zarr_scan(
-    #     path_to_scan=scan_metadata["zarr_path"],
-    #     median=scan_metadata["median"],
-    #     stdev=scan_metadata["stdev"],
-    # )
-
-    # px = scan.get_scan_array_copy()
-
-    # px = scan.create_rgb_scan_with_boxes(
-    #     px,
-    #     [patches_1],
-    #     torch.stack(sample_1_data["subset_shape"]).reshape(3).cpu().numpy().astype(int),
-    #     color=(255, 0, 0)
-    # )
-
-    # _px = _scan.create_rgb_scan_with_boxes(
-    #     _px,
-    #     sample_1_data["patch_indices"].squeeze(),
-    #     (1, 16, 16),
-    #     color=(0, 255, 0)
-    # )
-
-    # _px = _scan.create_rgb_scan_with_boxes(
-    #     _px,
-    #     [torch.stack(sample_2_data["subset_start"]).reshape(3).cpu().numpy().astype(int)],
-    #     torch.stack(sample_2_data["subset_shape"]).reshape(3).cpu().numpy().astype(int),
-    #     color=(255, 0, 0)
-    # )
-
-    # pox = _scan.create_rgb_scan_with_boxes(
-    #     _px,
-    #     sample_2_data["patch_indices"].squeeze(),
-    #     (1, 16, 16),
-    #     color=(0, 255, 0)
-    # )
-
-    # sloder = mo.ui.slider(start=0, stop=_px.shape[0]-1, value=sample_1_data["subset_center_idx"][0,0,0].item())
-    # sloder
-    # px = scan.get_scan_array_copy()
-    return
-
-
-@app.cell
-def _(RadiographyEncoder, os, torch):
-    def get_model(RUN_ID):
-        CHECKPOINT_PATH = f"/cbica/home/gangarav/checkpoints/{RUN_ID}/last.ckpt"
-
-        if not os.path.exists(CHECKPOINT_PATH):
-            raise FileNotFoundError(f"Checkpoint file not found at: {CHECKPOINT_PATH}")
-
-        # --- Step 4: Load the Model from the Checkpoint ---
-        print(f"Loading model from checkpoint: {CHECKPOINT_PATH}")
-
-        # This is the magic command. It will automatically read the hyperparameters
-        # saved in the .ckpt file and instantiate the model with them.
-        model = RadiographyEncoder.load_from_checkpoint(checkpoint_path=CHECKPOINT_PATH)
-
-        model.eval()
-
-        # Move model to GPU if available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-        return model
-
-    model = get_model('3d640eau')
+def _(get_model, run_id_input):
+    # This cell executes the model loading function when the Run ID changes
+    # and stores the result.
+    model, status = get_model(run_id_input.value)
+    # Display the status message (e.g., success or error)
+    status
     return (model,)
 
 
 @app.cell
+def _(mo, pd):
+    metadata_df = pd.read_parquet('/cbica/home/gangarav/rsna25/aneurysm_labels_cleaned_6_64_64.parquet')
+    metadata_df = metadata_df[metadata_df['SeriesInstanceUID'] != '1.2.826.0.1.3680043.8.498.40511751565674479940947446050421785002']
+    scan_table = mo.ui.table(metadata_df, page_size=10)
+
+    run_button = mo.ui.run_button(label="Generate and Compare Embeddings")
+    mo.vstack([
+        scan_table,
+        run_button
+    ])
+    return run_button, scan_table
+
+
+@app.cell
+def _(np):
+    PRISM_SHAPE = np.array([2, 128, 64])
+    PATCH_SHAPE = np.array([1, 16, 16])
+    N_PATCHES = 64
+
+    # if scan_table.value is not None and not scan_table.value.empty:
+    #     selected_row = scan_table.value.iloc[0]
+    #     scan = zarr_scan(
+    #         path_to_scan=selected_row["zarr_path"],
+    #         median=selected_row["median"],
+    #         stdev=selected_row["stdev"],
+    #         patch_shape=PATCH_SHAPE
+    #     )
+    # else:
+    #     scan = None
+    #     selected_row = None
+
+    # mo.md(f"**Scan Loaded:** `{os.path.basename(selected_row['zarr_path'])}`")
+    return N_PATCHES, PATCH_SHAPE, PRISM_SHAPE
+
+
+@app.cell
+def _():
+    # if scan:
+    #     max_z, max_y, max_x = scan.zarr_store['pixel_data'].shape - PRISM_SHAPE
+
+    #     # Use the first aneurysm location from metadata_df as default for prism 1
+    #     default_z1 = selected_row['aneurysm_z'] if len(metadata_df) > 0 else max_z // 3
+    #     default_y1 = selected_row['aneurysm_y'] if len(metadata_df) > 0 else max_y // 3
+    #     default_x1 = selected_row['aneurysm_x'] if len(metadata_df) > 0 else max_x // 3
+
+    #     # Ensure defaults are within bounds
+    #     default_z1 = max(0, min(default_z1, max_z))
+    #     default_y1 = max(0, min(default_y1, max_y))
+    #     default_x1 = max(0, min(default_x1, max_x))
+
+    #     # Sliders now control the CENTER of the prism
+    #     z1 = mo.ui.slider(0, max_z, label="Z₁ Center", value=default_z1)
+    #     y1 = mo.ui.slider(0, max_y, label="Y₁ Center", value=default_y1)
+    #     x1 = mo.ui.slider(0, max_x, label="X₁ Center", value=default_x1)
+
+    #     z2 = mo.ui.slider(0, max_z, label="Z₂ Center", value=2 * max_z // 3)
+    #     y2 = mo.ui.slider(0, max_y, label="Y₂ Center", value=2 * max_y // 3)
+    #     x2 = mo.ui.slider(0, max_x, label="X₂ Center", value=2 * max_x // 3)
+
+
+    #     controls = mo.hstack([
+    #         mo.vstack([mo.md("**Prism 1**"), z1, y1, x1]),
+    #         mo.vstack([mo.md("**Prism 2**"), z2, y2, x2]),
+    #     ], justify='space-around')
+
+    # mo.vstack([controls, run_button])
+    return
+
+
+@app.cell
 def _(
-    label,
-    model,
-    patch_coords_1,
-    patch_coords_2,
-    patches_1,
-    patches_2,
-    row_id,
+    DataLoader,
+    IterableDataset,
+    N_PATCHES,
+    PATCH_SHAPE,
+    scan_table,
     torch,
+    zarr_scan,
 ):
+    class InteractiveDataset(IterableDataset):
+        """Interactive dataset for validation with both aneurysm-centered and random patches."""
+
+        def __init__(self, prism_shape=(6, 64, 64), patch_shape=None, n_patches=None, n_windows=5, n_repeated=2):
+            super().__init__()
+            # Use the table widget's current selection as metadata source
+            self.metadata = scan_table.value
+            self.prism_shape = prism_shape
+            self.patch_shape = patch_shape
+            self.n_patches = n_patches
+            self.n_windows = n_windows
+            self.n_repeated = n_repeated
+            print(f"Initialized interactive dataset with {len(self.metadata)} samples.")
+
+        def __iter__(self):
+            """Yield both aneurysm-centered and random patches for each scan."""
+            for _, row in self.metadata.iterrows():
+                try:
+                    # Extract scan information
+                    zarr_path = row["zarr_path"]
+                    median = row["median"]
+                    stdev = row["stdev"]
+                    z, y, x = row['aneurysm_z'], row['aneurysm_y'], row['aneurysm_x']
+                    location = row['location']
+
+                    # Load scan
+                    scan = zarr_scan(
+                        path_to_scan=zarr_path,
+                        median=median,
+                        stdev=stdev,
+                        patch_shape=self.patch_shape
+                    )
+
+                    for w_id in range(self.n_windows):
+
+                        # Yield aneurysm-centered patches
+                        sample = scan.train_sample(
+                            n_patches=self.n_patches,
+                            subset_start=(z - self.prism_shape[0] / 2, y - self.prism_shape[1] / 2, x - self.prism_shape[2] / 2),
+                            subset_shape=self.prism_shape,
+                        )
+
+                        patches = torch.from_numpy(sample["normalized_patches"]).float()
+                        patch_coords = torch.from_numpy(sample['patch_centers_pt'] - sample['subset_center_pt']).float()
+
+                        yield patches, patch_coords, location, zarr_path, sample['wc'], sample['ww'], sample['subset_start'][0], sample['subset_start'][1], sample['subset_start'][2] 
+
+                        for r_id in range(self.n_repeated):
+                            # Yield random patches for comparison
+                            sample = scan.train_sample(
+                                n_patches=self.n_patches,
+                                subset_shape=self.prism_shape,
+                            )
+
+                            patches = torch.from_numpy(sample["normalized_patches"]).float()
+                            patch_coords = torch.from_numpy(sample['patch_centers_pt'] - sample['subset_center_pt']).float()
+
+                            yield patches, patch_coords, "random", zarr_path, sample['wc'], sample['ww'], sample['subset_start'][0], sample['subset_start'][1], sample['subset_start'][2]
+
+                except Exception as e:
+                    print(f"Skipping sample due to error: {e} in {row.get('zarr_path', 'N/A')}")
+                    continue
+
+    interactive_dataset = InteractiveDataset(
+        patch_shape=PATCH_SHAPE,
+        n_patches=N_PATCHES,
+        n_windows=10,
+        n_repeated=10
+    )
+
+    interactive_loader = DataLoader(
+        interactive_dataset,
+        batch_size=64
+    )
+    return (interactive_loader,)
+
+
+@app.cell
+def _(interactive_loader, model, pd, run_button, torch):
+    # Run model on interactive loader outputs
     device = next(model.parameters()).device
+    results = []
+    if run_button.value:
+        for patches, patch_coords, location, zarr_path, wc, ww, prism_start_z, prism_start_y, prism_start_x in interactive_loader:
+            patches = patches.to(device)
+            patch_coords = patch_coords.to(device)
 
-    embeddings = []
-    locations = []
+            with torch.no_grad():
+                embeddings = model.encoder(patches, patch_coords)[:, 1]
 
-    b = patches_1, patches_2, patch_coords_1, patch_coords_2, row_id, label
-    b = tuple(t.to(device) for t in b)
-    with torch.no_grad():
-        print(model.training_step(b, 0))
-    print(label)
+            # Convert to numpy for easier handling
+            embeddings_np = embeddings.cpu().numpy()
+
+            # Create DataFrame with proper lengths
+            batch_results = pd.DataFrame({
+                'embedding': list(embeddings_np),
+                'location': location,
+                'wc': [round(float(w), 1) for w in wc],
+                'ww': [round(float(w), 1) for w in ww],
+                'zarr': zarr_path,
+                'prism_start_z': [int(_z) for _z in prism_start_z],
+                'prism_start_y': [int(_y) for _y in prism_start_y],
+                'prism_start_x': [int(_x) for _x in prism_start_x],
+            })
+            results.append(batch_results)
+
+        results_df = pd.concat(results, ignore_index=True)
+        results_df
+    return device, results_df
+
+
+@app.cell
+def _(np, results_df):
+    # Prepare data from results_df
+    all_embeddings = np.vstack(results_df['embedding'].values)
+    all_locations = results_df['location'].tolist()
+
+    # Filter for actual locations (not 'random')
+    filter_mask = results_df['location'] != ''
+    filtered_embeddings = all_embeddings[filter_mask]
+    filtered_locations = [loc for loc, m in zip(all_locations, filter_mask) if m]
+
+    # Perform UMAP for visualization
+    import umap
+    umap_reducer = umap.UMAP(n_components=2, random_state=42).fit(filtered_embeddings)
+    return filter_mask, filtered_embeddings, umap_reducer
+
+
+@app.cell
+def _(alt, filter_mask, filtered_embeddings, mo, results_df, umap_reducer):
+    # Create DataFrame for plotting based on results_df with new columns
+    plot_df = results_df[filter_mask].copy()
+    embeddings_2d = umap_reducer.transform(filtered_embeddings)
+    plot_df['UMAP1'] = embeddings_2d[:, 0]
+    plot_df['UMAP2'] = embeddings_2d[:, 1]
+    plot_df = plot_df.drop(columns=['embedding'])
+
+    domain_values = plot_df['location'].unique().tolist()
+    range_values = [
+        'rgba(31, 119, 180, 0.3)', 
+        'rgba(255, 127, 14, 0.1)', 
+        'rgba(44, 160, 44, 0.3)', 
+        'rgba(214, 39, 40, 0.3)', 
+        'rgba(148, 103, 189, 0.3)', 
+        'rgba(140, 86, 75, 0.3)', 
+        'rgba(227, 119, 194, 0.3)', 
+        'rgba(127, 127, 127, 0.3)', 
+        'rgba(188, 189, 34, 0.3)', 
+        'rgba(23, 190, 207, 0.3)'
+    ][:len(domain_values)]
+
+    chart = mo.ui.altair_chart(alt.Chart(plot_df).mark_circle(size=100).encode(
+        x='UMAP1',
+        y='UMAP2',
+        color=alt.Color('location:N', 
+                       scale=alt.Scale(domain=domain_values, range=range_values),
+                       legend=alt.Legend(title="True Location")),
+        tooltip=['location', 'wc', 'ww', 'prism_start_z', 'prism_start_y', 'prism_start_x']
+    ))
+
+    chart
+    return (chart,)
+
+
+@app.cell
+def _(chart):
+    chart.value
     return
 
 
 @app.cell
-def _(label):
-    label
-    return
+def _(PATCH_SHAPE, PRISM_SHAPE, chart, mo, np, zarr_scan):
+    # Create visualization using your class method
+    selected_plot_df = chart.value.iloc[0]
 
+    # Load the scan for the selected row
+    scan = zarr_scan(
+        path_to_scan=selected_plot_df["zarr"],
+        median=selected_plot_df["wc"],
+        stdev=selected_plot_df["ww"],
+        patch_shape=PATCH_SHAPE
+    )
 
-@app.cell
-def _(mo, sample_1_data, sample_2_data, scan_metadata, torch, zarr_scan):
-    _scan = zarr_scan(
-            path_to_scan=scan_metadata["path_to_scan"][0],
-            median=scan_metadata["median"][0],
-            stdev=scan_metadata["stdev"][0],
-            patch_shape=scan_metadata["patch_shape"][0]
-        )
-    _px = _scan.get_scan_array_copy()
+    # Get normalized scan pixels
+    scan_pixels = scan.get_scan_array_copy()
+    scan_pixels_norm = scan.normalize_pixels_to_range(
+        scan_pixels, 
+        selected_plot_df["wc"], 
+        selected_plot_df["ww"], 
+        out_range=(0, 1)
+    )
 
-    _px = _scan.create_rgb_scan_with_boxes(
-        _px,
-        [torch.stack(sample_1_data["subset_start"]).reshape(3).cpu().numpy().astype(int)],
-        torch.stack(sample_1_data["subset_shape"]).reshape(3).cpu().numpy().astype(int),
+    # Calculate prism start coordinates (center - half prism shape)
+    prism_start = np.array([
+        selected_plot_df["prism_start_z"],
+        selected_plot_df["prism_start_y"],
+        selected_plot_df["prism_start_x"]
+    ])
+
+    # Create visualization with the selected prism
+    viz_scan = scan.create_rgb_scan_with_boxes(
+        scan_pixels_norm, 
+        [prism_start.astype(int)], 
+        PRISM_SHAPE, 
         color=(255, 0, 0)
     )
 
-    _px = _scan.create_rgb_scan_with_boxes(
-        _px,
-        sample_1_data["patch_indices"].squeeze(),
-        (1, 16, 16),
-        color=(0, 255, 0)
-    )
-
-    _px = _scan.create_rgb_scan_with_boxes(
-        _px,
-        [torch.stack(sample_2_data["subset_start"]).reshape(3).cpu().numpy().astype(int)],
-        torch.stack(sample_2_data["subset_shape"]).reshape(3).cpu().numpy().astype(int),
-        color=(255, 0, 0)
-    )
-
-    pox = _scan.create_rgb_scan_with_boxes(
-        _px,
-        sample_2_data["patch_indices"].squeeze(),
-        (1, 16, 16),
-        color=(0, 255, 0)
-    )
-
-    sloder = mo.ui.slider(start=0, stop=_px.shape[0]-1, value=sample_1_data["subset_center_idx"][0,0,0].item())
-    sloder
-    return pox, sloder
+    viz_slider = mo.ui.slider(0, viz_scan.shape[0] - 1, value=selected_plot_df["prism_start_z"])
+    viz_slider
+    return viz_scan, viz_slider
 
 
 @app.cell
-def _(label, mo, pox, sample_1_data, sample_2_data, sloder):
-    mo.hstack([
-        mo.image(src=pox[sloder.value], width=256),
-        mo.image(src=pox[sample_1_data["subset_center_idx"][0,0,0].item()], width=256),
-        mo.image(src=pox[sample_2_data["subset_center_idx"][0,0,0].item()], width=256),
-        [label[0,2].item(),
-        label[0,0].item(),
-        label[0,1].item()]
-    ], justify="start", gap=0)
+def _(mo, viz_scan, viz_slider):
+    mo.image(src=viz_scan[viz_slider.value])
     return
 
 
 @app.cell
-def _(centers, mo, patches, pox, sloder):
-    mo.hstack([
-        mo.vstack([
-            mo.image(src=pox[sloder.value], width=512)
-        ]),
-        mo.vstack([
-            mo.hstack([mo.image(src=patches[0,_i+_j*8,0], height=32, width=32) for _i in range(8)], justify="start", gap=0) for _j in range(8)
-        ] + [patches.max(),patches.min(),centers.max(),centers.min()], gap=0)
-    ], widths=[512, 512])
+def _(chart, results_df):
+    selected_zarr = chart.value.iloc[0]['zarr']
+    filtered_results_df = results_df[results_df['zarr'] == selected_zarr].copy()
+    filtered_results_df
+    return (filtered_results_df,)
+
+
+@app.cell
+def _(filtered_results_df):
+    filtered_results_df['embedding'].iloc[0].shape
+    return
+
+
+@app.cell
+def _(device, filtered_results_df, model, torch):
+    _row1 = torch.tensor(filtered_results_df['embedding'].iloc[0]).to(device)
+    _row2 = torch.tensor(filtered_results_df['embedding'].iloc[1]).to(device)
+
+    fused_view_cls = torch.cat((_row1, _row2), dim=0)
+
+    model.relative_pos_head(fused_view_cls.unsqueeze(0))
     return
 
 
@@ -386,49 +417,6 @@ def _():
 
 @app.cell
 def _():
-    # from sklearn.decomposition import PCA
-    # import matplotlib.pyplot as plt
-    # from mpl_toolkits.mplot3d import Axes3D
-
-    # # Filter data for Right and Left Middle Cerebral Artery
-    # filtered_indices = [i for i, loc in enumerate(locations) 
-    #                    if loc in ["Right Middle Cerebral Artery", "Left Middle Cerebral Artery"]]
-    # filtered_embeddings = embeddings[filtered_indices]
-    # filtered_locations = [locations[i] for i in filtered_indices]
-
-    # # Perform 3D PCA
-    # pca = PCA(n_components=3)
-    # embeddings_3d = pca.fit_transform(filtered_embeddings)
-
-    # # Create color mapping for locations
-    # unique_locations = list(set(filtered_locations))
-    # color_map = {loc: plt.cm.Set3(i / len(unique_locations)) 
-    #              for i, loc in enumerate(unique_locations)}
-    # colors = [color_map[loc] for loc in filtered_locations]
-
-    # # Create 3D scatter plot
-    # fig = plt.figure(figsize=(10, 8))
-    # ax = fig.add_subplot(111, projection='3d')
-    # scatter = ax.scatter(embeddings_3d[:, 0], 
-    #                     embeddings_3d[:, 1], 
-    #                     embeddings_3d[:, 2],
-    #                     c=colors,
-    #                     alpha=0.7,
-    #                     s=50)
-
-    # # Add legend for locations
-    # legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
-    #                                markerfacecolor=color_map[loc], 
-    #                                markersize=10, label=loc) 
-    #                   for loc in unique_locations]
-    # ax.legend(handles=legend_elements, title='Locations', bbox_to_anchor=(1.05, 1), loc='upper left')
-
-    # ax.set_xlabel('PC1')
-    # ax.set_ylabel('PC2')
-    # ax.set_zlabel('PC3')
-    # ax.set_title('3D PCA of Embeddings Colored by Location')
-
-    # plt.gca()
     return
 
 
