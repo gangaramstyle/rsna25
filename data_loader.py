@@ -1,7 +1,7 @@
 import marimo
 
-__generated_with = "0.14.17"
-app = marimo.App(width="columns")
+__generated_with = "0.15.2"
+app = marimo.App(width="full")
 
 with app.setup:
     import torch
@@ -19,43 +19,61 @@ with app.setup:
     import matplotlib.pyplot as plt
     from typing import Optional, Tuple, Dict, Any
     import pydicom
+    from rvt_model import PosEmbedding3D
+    import nibabel as nib
 
 
 @app.cell
 def _():
-    stats_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/zarr_stats.parquet')
-    og_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/metadata.parquet')
-    merged_df = pd.merge(
-        og_pd,
-        stats_pd,
-        on='zarr_path',
-        how='left'
-    )
-    metadata = merged_df
-    table = mo.ui.table(metadata, selection='single')
+    metadata_df = pd.read_parquet('/cbica/home/gangarav/rsna_any/rsna_2025/combined_metadata.parquet')
+    #pd.read_parquet('/cbica/home/gangarav/rsna25/aneurysm_labels_cleaned_6_64_64.parquet')
+    metadata_df = metadata_df[metadata_df['series_uid'] != '1.2.826.0.1.3680043.8.498.40511751565674479940947446050421785002']
+    table = mo.ui.table(metadata_df, selection='single')
+
     table
-    return (table,)
+    return metadata_df, table
 
 
 @app.cell
-def _(table):
-    metadata_row = table.value
-    return (metadata_row,)
+def _():
+    patch_size_input = mo.ui.text(value="16", label="Patch Size:")
+    n_patches_input = mo.ui.text(value="64", label="Num Patches:")
+    n_aux_patches_input = mo.ui.text(value="16", label="Num Aux Patches:")
+    run_button = mo.ui.run_button()
+    mo.vstack([patch_size_input, n_patches_input, n_aux_patches_input, run_button])
+    return n_aux_patches_input, n_patches_input, patch_size_input, run_button
 
 
 @app.cell
-def _(metadata_row):
-    zarr_name = metadata_row["zarr_path"].values[0]
-    patch_shape = [1, 16, 16]
-    # n_patches
-    scan = zarr_scan(path_to_scan=zarr_name, median=metadata_row["median"].values[0], stdev=metadata_row["stdev"].values[0], patch_shape=patch_shape)
-    return patch_shape, scan
+def _(
+    metadata_df,
+    n_aux_patches_input,
+    n_patches_input,
+    patch_size_input,
+    run_button,
+    table,
+):
+    if run_button.value:
+        patch_size = int(patch_size_input.value)
+        n_patches = int(n_patches_input.value)
+        n_aux_patches = int(n_aux_patches_input.value)
+
+        if table.value.empty:
+            metadata_row = metadata_df.sample(1)
+        else:
+            metadata_row = table.value
+
+        zarr_name = metadata_row["zarr_path"].values[0]
+
+        patch_shape = (1, patch_size, patch_size)
+        scan = zarr_scan(path_to_scan=zarr_name, median=metadata_row["median"].values[0], stdev=metadata_row["stdev"].values[0], patch_shape=patch_shape)
+        sample = scan.train_sample(n_patches)
+    return patch_shape, sample, scan
 
 
 @app.cell
-def _(scan):
-    sample = scan.train_sample(128)
-    return (sample,)
+def _():
+    return
 
 
 @app.cell
@@ -85,33 +103,51 @@ def _():
 
 @app.cell
 def _(sample):
+    sample["normalized_patches"].max(), sample["normalized_patches"].min()
+    return
+
+
+@app.cell
+def _(sample):
     sample
     return
 
 
 @app.cell
-def _(scan_pixels, slider):
-    mo.image(scan_pixels[slider.value], width=512)
+def _(sample, scan_pixels, slider):
+    patches_for_display = sample["normalized_patches"].squeeze()
+    patches_for_display[:,0,:] = -1
+    patches_for_display[:,:,0] = 1
+
+    mo.hstack([
+        mo.image(scan_pixels[slider.value], width=512),
+        mo.image(rearrange(
+            patches_for_display,
+            '(h_grid w_grid) h w -> (h_grid h) (w_grid w)',
+            h_grid=8
+        ), width=512)
+    ])
     return
 
 
 @app.cell
 def _(patch_shape, sample, scan):
     scan_pixels = scan.normalize_pixels_to_range(scan.get_scan_array_copy(), sample["wc"] - 0.5*sample["ww"], sample["wc"] + 0.5*sample["ww"])
+    scan
 
     scan_pixels = scan.create_rgb_scan_with_boxes(
         scan_pixels,
         [sample["subset_start"]],
         sample["subset_shape"],
         None,
-        (255, 0, 0)
+        (100, 0, 0)
     )
     scan_pixels = scan.create_rgb_scan_with_boxes(
         scan_pixels,
         sample["patch_indices"],
         patch_shape,
         None,
-        (0, 255, 0)
+        (0, 100, 0)
     )
 
     slider = mo.ui.slider(start=0, stop=scan_pixels.shape[0]-1,value=int(sample["subset_center_idx"][0,0]))
@@ -120,7 +156,21 @@ def _(patch_shape, sample, scan):
 
 
 @app.cell
-def _():
+def _(sample):
+    pos_emb = PosEmbedding3D(600, max_freq = 30)
+    coords = torch.from_numpy(sample["patch_centers_pt"] - sample["subset_center_pt"]).unsqueeze(0).to(torch.float32)
+    print(coords)
+    sin, cos = pos_emb(torch.asinh(coords))
+    mo.vstack([
+        mo.image(src=sin[0]),
+        mo.image(src=cos[0])
+    ])
+    return (coords,)
+
+
+@app.cell
+def _(coords):
+    coords.max(dim=1)[0], coords.min(dim=1)[0]
     return
 
 
@@ -540,28 +590,47 @@ class zarr_scan():
 
         return patches
 
-    def convert_indices_to_patient_space(self, patch_indices):
+    def convert_indices_to_patient_space(self, voxel_indices):
         affine_matrices = self.zarr_store['slice_affines'][:] # Load into memory
 
-        # We need the affine matrix for the *starting slice* of each patch
-        slice_indices = patch_indices[:, 0]
-        selected_affine_matrices = affine_matrices[slice_indices]
+        if len(affine_matrices.shape) == 2:
+            # the source data is likely a nifti and just use the singular 4x4 matrix for the transform
+            patient_coords = nib.affines.apply_affine(affine_matrices, voxel_indices)
+            print(patient_coords.shape)
+        else:
+            # 1. Get the slice index 'd' for each point.
+            slice_indices = voxel_indices[:, 0].astype(int)
 
-        # Homogeneous coordinates for (r, c) -> (r, c, 1)
-        # Note: DICOM standard is often (x, y) which maps to (c, r)
-        # We assume indices are (d, r, c) and affines map (r, c)
-        coords_rc = patch_indices[:, 1:]
-        ones_column = np.ones((coords_rc.shape[0], 1))
-        # Create homogeneous coordinates in (c, r, 1) order for standard affine multiplication
-        homogeneous_coords = np.hstack([coords_rc[:, ::-1], ones_column])
+            # 2. Select the specific 4x4 affine matrix for each point's slice.
+            # This results in a stack of shape (N, 4, 4).
+            selected_affines = affine_matrices[slice_indices]
 
-        # Batched matrix multiplication: (N, 3, 3) @ (N, 3, 1) -> (N, 3, 1)
-        patient_coords = np.matmul(
-            selected_affine_matrices,
-            homogeneous_coords[:, :, np.newaxis]
-        ).squeeze(axis=2)
+            # 3. Get the in-plane row and column indices (r, c).
+            coords_rc = voxel_indices[:, 1:]  # Shape: (N, 2)
 
-        return patient_coords[:,:-1]
+            # 4. Construct the 4-element homogeneous voxel coordinates [r, c, 0, 1].
+            # The '0' indicates the position is on the 2D plane itself.
+            # The '1' is the homogeneous coordinate.
+            num_points = voxel_indices.shape[0]
+            zeros_col = np.zeros((num_points, 1))
+            ones_col = np.ones((num_points, 1))
+
+            # We construct the vector [r, c, 0, 1] because our affine matrix was built
+            # with column 0 for 'r' steps and column 1 for 'c' steps.
+            homogeneous_coords = np.hstack([coords_rc, zeros_col, ones_col]) # Shape: (N, 4)
+
+            # 5. Perform batched matrix multiplication.
+            # We need to reshape homogeneous_coords for matmul: (N, 4) -> (N, 4, 1)
+            # The operation is: (N, 4, 4) @ (N, 4, 1) -> (N, 4, 1)
+            patient_coords_homogeneous = np.matmul(
+                selected_affines,
+                homogeneous_coords[:, :, np.newaxis]
+            )
+
+            # 6. Squeeze the result and extract the (x, y, z) components.
+            # The result is (N, 4, 1), squeeze to (N, 4), then take the first 3 columns.
+            patient_coords = patient_coords_homogeneous.squeeze(axis=2)[:, :3]
+        return patient_coords/10
 
 
 @app.cell

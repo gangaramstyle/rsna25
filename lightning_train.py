@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.14.17"
+__generated_with = "0.15.0"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -42,7 +42,10 @@ class RadiographyEncoder(L.LightningModule):
         encoder_heads,
         mlp_dim,
         n_registers,
+        # position embedding
+        pos_max_freq,
         use_rotary,
+        use_absolute,
         # training runtime hyperparameters
         batch_size,
         learning_rate,
@@ -72,6 +75,8 @@ class RadiographyEncoder(L.LightningModule):
             heads=encoder_heads,
             mlp_dim=mlp_dim,
             use_rotary=use_rotary,
+            pos_max_freq=pos_max_freq,
+            use_absolute=use_absolute,
         )
 
         # CAUTION: relative view head requires two concatenated
@@ -259,7 +264,7 @@ class RadiographyEncoder(L.LightningModule):
 @app.class_definition
 class PrismOrderingDataset(IterableDataset):
 
-    def __init__(self, metadata, patch_shape, position_space, n_patches, n_aux_patches, n_sampled_from_same_study=64, scratch_dir="/scratch/gangarav/"):
+    def __init__(self, metadata, patch_shape, position_space, n_patches, n_aux_patches, n_sampled_from_same_study, scratch_dir):
         super().__init__()
         stats_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/zarr_stats.parquet')
         og_pd = pd.read_parquet('/cbica/home/gangarav/data_25_processed/metadata.parquet')
@@ -520,12 +525,14 @@ def train_run(default_config=None):
     # `wandb.init()` will automatically pick up hyperparameters from a sweep agent.
     # If resuming, it will use the WANDB_RUN_ID environment variable.
     # The `resume="allow"` option is key to enabling this behavior.
-    run = wandb.init(config=default_config, resume="allow")
-    print(run)
+    run = wandb.init(resume="allow")
+
+    print(run.config)
+    print("======\n")
     checkpoint_dir = f'/cbica/home/gangarav/checkpoints/{run.id}'
 
     # Pull the final config from wandb. This includes sweep params and defaults.
-    cfg = wandb.config
+    cfg = run.config
 
     # --- 2. Handle Resuming ---
     ckpt_path = None
@@ -546,7 +553,9 @@ def train_run(default_config=None):
         encoder_heads=cfg.encoder_heads,
         mlp_dim=cfg.mlp_dim,
         n_registers=cfg.n_registers,
-        use_rotary=True,
+        pos_max_freq=cfg.max_freq,
+        use_rotary=cfg.use_rotary,
+        use_absolute=cfg.use_absolute,
         batch_size=cfg.batch_size,
         learning_rate=cfg.learning_rate,
         patch_size=(1, 16, 16),
@@ -564,8 +573,8 @@ def train_run(default_config=None):
     if scratch_dir is None:
         # If the variable isn't set, raise an error or use a default.
         # For a cluster job, it's better to fail loudly.
-        # raise ValueError("Environment variable TMP is not set. This is required for the scratch directory.")
-        scratch_dir = "/scratch/gangarav/"
+        raise ValueError("Environment variable TMP is not set. This is required for the scratch directory.")
+        # scratch_dir = "/scratch/gangarav/"
 
     dataset = PrismOrderingDataset(
         metadata=METADATA_PATH,
@@ -671,7 +680,7 @@ def _():
         'window_objective': True,
         'num_repeated_study_samples': 1,
     }
-    train_run(default_config=default_config)
+    train_run() #default_config=default_config)
     return
 
 

@@ -1,0 +1,52 @@
+# mim_sweep.yaml
+program: mim_lightning_train.py  # Use the name of your script
+method: bayes
+metric:
+  name: loss
+  goal: minimize
+parameters:
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.00003
+    max: 0.001
+  encoder_depth:
+    values: [8, 10, 12]
+  encoder_heads:
+    value: 12
+  encoder_dim:
+    values: [288, 432]
+  mlp_dim:
+    values: [512, 768]
+  batch_size:
+    values: [128, 256]
+  n_registers:
+    values: [4, 8, 12]
+  pos_objective_mode:
+    values: ['classification']
+  position_space:
+    values: ['patient', 'pixel']
+  n_aux_patches:
+    values: [0, 4, 8]
+  window_objective:
+    values: [true, false]
+  scan_contrastive_objective:
+    values: [true]
+  mim_objective:
+    values: [true]
+  num_repeated_study_samples:
+    values: [4, 8, 16, 32]
+  use_rotary:
+    values: [true, false]
+  use_absolute:
+    values: [true, false]
+  max_freq:
+    values: [14, 30, 45]
+  include_nifti:
+    values: [true, false]
+
+command:
+  - ${env}
+  - uv # Use your environment runner
+  - run
+  - ${program}
+

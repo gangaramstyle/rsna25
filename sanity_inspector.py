@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.15.0"
+__generated_with = "0.15.2"
 app = marimo.App(width="medium")
 
 
@@ -40,7 +40,7 @@ def _(RadiographyEncoder, mo, os, torch):
 
     # Input for the user to provide the wandb Run ID
     run_id_input = mo.ui.text(
-        value="rwibpui9", # A default value to start with
+        value="30bqtiji", # A default value to start with
         label="Enter `wandb` Run ID:"
     )
 
@@ -103,7 +103,7 @@ def _(mo, pd):
 
 @app.cell
 def _(np):
-    PRISM_SHAPE = np.array([2, 128, 64])
+    PRISM_SHAPE = np.array([1, 128, 128])
     PATCH_SHAPE = np.array([1, 16, 16])
     N_PATCHES = 64
 
@@ -212,7 +212,7 @@ def _(
                         patches = torch.from_numpy(sample["normalized_patches"]).float()
                         patch_coords = torch.from_numpy(sample['patch_centers_pt'] - sample['subset_center_pt']).float()
 
-                        yield patches, patch_coords, location, zarr_path, sample['wc'], sample['ww'], sample['subset_start'][0], sample['subset_start'][1], sample['subset_start'][2] 
+                        yield patches, patch_coords, location, zarr_path, sample['wc'], sample['ww'], sample['subset_start'][0], sample['subset_start'][1], sample['subset_start'][2], sample['subset_center_pt'][0][0], sample['subset_center_pt'][0][1], sample['subset_center_pt'][0][2]
 
                         for r_id in range(self.n_repeated):
                             # Yield random patches for comparison
@@ -224,7 +224,7 @@ def _(
                             patches = torch.from_numpy(sample["normalized_patches"]).float()
                             patch_coords = torch.from_numpy(sample['patch_centers_pt'] - sample['subset_center_pt']).float()
 
-                            yield patches, patch_coords, "random", zarr_path, sample['wc'], sample['ww'], sample['subset_start'][0], sample['subset_start'][1], sample['subset_start'][2]
+                            yield patches, patch_coords, "random", zarr_path, sample['wc'], sample['ww'], sample['subset_start'][0], sample['subset_start'][1], sample['subset_start'][2], sample['subset_center_pt'][0][0], sample['subset_center_pt'][0][1], sample['subset_center_pt'][0][2]
 
                 except Exception as e:
                     print(f"Skipping sample due to error: {e} in {row.get('zarr_path', 'N/A')}")
@@ -250,7 +250,8 @@ def _(interactive_loader, model, pd, run_button, torch):
     device = next(model.parameters()).device
     results = []
     if run_button.value:
-        for patches, patch_coords, location, zarr_path, wc, ww, prism_start_z, prism_start_y, prism_start_x in interactive_loader:
+        for patches, patch_coords, location, zarr_path, wc, ww, prism_start_z, prism_start_y, prism_start_x, subset_center_z, subset_center_y, subset_center_x in interactive_loader:
+
             patches = patches.to(device)
             patch_coords = patch_coords.to(device)
 
@@ -270,6 +271,9 @@ def _(interactive_loader, model, pd, run_button, torch):
                 'prism_start_z': [int(_z) for _z in prism_start_z],
                 'prism_start_y': [int(_y) for _y in prism_start_y],
                 'prism_start_x': [int(_x) for _x in prism_start_x],
+                'subset_center_z': [float(_z) for _z in subset_center_z],
+                'subset_center_y': [float(_y) for _y in subset_center_y],
+                'subset_center_x': [float(_x) for _x in subset_center_x],
             })
             results.append(batch_results)
 
@@ -285,7 +289,7 @@ def _(np, results_df):
     all_locations = results_df['location'].tolist()
 
     # Filter for actual locations (not 'random')
-    filter_mask = results_df['location'] != ''
+    filter_mask = results_df['location'] != 'random'
     filtered_embeddings = all_embeddings[filter_mask]
     filtered_locations = [loc for loc, m in zip(all_locations, filter_mask) if m]
 
@@ -306,9 +310,9 @@ def _(alt, filter_mask, filtered_embeddings, mo, results_df, umap_reducer):
 
     domain_values = plot_df['location'].unique().tolist()
     range_values = [
-        'rgba(31, 119, 180, 0.3)', 
-        'rgba(255, 127, 14, 0.1)', 
-        'rgba(44, 160, 44, 0.3)', 
+        'rgba(31, 119, 180, 0.5)', 
+        'rgba(255, 127, 14, 0.5)', 
+        'rgba(44, 160, 44, 0.5)', 
         'rgba(214, 39, 40, 0.3)', 
         'rgba(148, 103, 189, 0.3)', 
         'rgba(140, 86, 75, 0.3)', 
@@ -332,15 +336,19 @@ def _(alt, filter_mask, filtered_embeddings, mo, results_df, umap_reducer):
 
 
 @app.cell
-def _(chart):
-    chart.value
-    return
+def _(chart, mo, results_df):
+    selected_zarr = chart.value.iloc[0]['zarr']
+    filtered_results_df = results_df[results_df['zarr'] == selected_zarr].copy()
+    prism_table = mo.ui.table(filtered_results_df, selection="single")
+    prism_table
+    return filtered_results_df, prism_table
 
 
 @app.cell
-def _(PATCH_SHAPE, PRISM_SHAPE, chart, mo, np, zarr_scan):
+def _(PATCH_SHAPE, PRISM_SHAPE, chart, mo, np, prism_table, zarr_scan):
     # Create visualization using your class method
     selected_plot_df = chart.value.iloc[0]
+    comparison_prism = prism_table.value.iloc[0]
 
     # Load the scan for the selected row
     scan = zarr_scan(
@@ -371,38 +379,61 @@ def _(PATCH_SHAPE, PRISM_SHAPE, chart, mo, np, zarr_scan):
         scan_pixels_norm, 
         [prism_start.astype(int)], 
         PRISM_SHAPE, 
-        color=(255, 0, 0)
+        color=(200, 0, 0)
     )
+
+    # Calculate prism start coordinates (center - half prism shape)
+    prism_start = np.array([
+        comparison_prism["prism_start_z"],
+        comparison_prism["prism_start_y"],
+        comparison_prism["prism_start_x"]
+    ])
+
+    # Create visualization with the selected prism
+    viz_scan = scan.create_rgb_scan_with_boxes(
+        viz_scan, 
+        [prism_start.astype(int)], 
+        PRISM_SHAPE, 
+        color=(0, 200, 0)
+    )
+
 
     viz_slider = mo.ui.slider(0, viz_scan.shape[0] - 1, value=selected_plot_df["prism_start_z"])
     viz_slider
-    return viz_scan, viz_slider
+    return (
+        comparison_prism,
+        prism_start,
+        selected_plot_df,
+        viz_scan,
+        viz_slider,
+    )
 
 
 @app.cell
-def _(mo, viz_scan, viz_slider):
-    mo.image(src=viz_scan[viz_slider.value])
+def _(
+    comparison_prism,
+    mo,
+    prism_start,
+    selected_plot_df,
+    viz_scan,
+    viz_slider,
+):
+    mo.hstack([
+        mo.image(src=viz_scan[viz_slider.value]),
+        mo.image(src=viz_scan[prism_start[0]]),
+        mo.vstack([
+            comparison_prism["subset_center_z"] - selected_plot_df["subset_center_z"],
+            comparison_prism["subset_center_y"] - selected_plot_df["subset_center_y"],
+            comparison_prism["subset_center_x"] - selected_plot_df["subset_center_x"],
+        ])
+    ])
     return
 
 
 @app.cell
-def _(chart, results_df):
-    selected_zarr = chart.value.iloc[0]['zarr']
-    filtered_results_df = results_df[results_df['zarr'] == selected_zarr].copy()
-    filtered_results_df
-    return (filtered_results_df,)
-
-
-@app.cell
-def _(filtered_results_df):
-    filtered_results_df['embedding'].iloc[0].shape
-    return
-
-
-@app.cell
-def _(device, filtered_results_df, model, torch):
+def _(device, filtered_results_df, model, prism_table, torch):
     _row1 = torch.tensor(filtered_results_df['embedding'].iloc[0]).to(device)
-    _row2 = torch.tensor(filtered_results_df['embedding'].iloc[1]).to(device)
+    _row2 = torch.tensor(prism_table.value['embedding'].iloc[0]).to(device)
 
     fused_view_cls = torch.cat((_row1, _row2), dim=0)
 

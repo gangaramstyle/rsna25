@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.14.16"
+__generated_with = "0.15.0"
 app = marimo.App(width="full")
 
 with app.setup:
@@ -111,18 +111,13 @@ class Transformer(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([])
 
-        # TODO: Are we ok with max_freq of 50? What does this correspond to in cm?
-        self.pos_emb = PosEmbedding3D(dim_head, max_freq = 3)
-
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout, use_rotary = use_rotary),
                 FeedForward(dim, mlp_dim, dropout = dropout, use_glu = use_glu)
             ]))
 
-    def forward(self, x, coords, n_non_input_tokens):
-        # DELTA: this is different than lucid-rains implementation
-        pos_emb = self.pos_emb(coords)
+    def forward(self, x, pos_emb, n_non_input_tokens):
 
         for attn, ff in self.layers:
             x = attn(x, pos_emb, n_non_input_tokens) + x
@@ -132,7 +127,7 @@ class Transformer(nn.Module):
 
 @app.class_definition
 class RvT(nn.Module):
-    def __init__(self, *, patch_size, dim, depth, heads, mlp_dim, register_count=8, dropout = 0., emb_dropout = 0., use_rotary = True, use_glu = True):
+    def __init__(self, *, patch_size, dim, depth, heads, mlp_dim, register_count=8, dropout = 0., emb_dropout = 0., pos_max_freq = 30, use_absolute = False, use_rotary = True, use_glu = True):
         super().__init__()
 
         assert dim % heads == 0, 'Model dimension `dim` must be divisible by the number of `heads`.'
@@ -150,6 +145,11 @@ class RvT(nn.Module):
             nn.Linear(patch_dim, dim),
         )
 
+        self.abs_pos_emb = PosEmbedding3D(dim, max_freq = pos_max_freq)
+        self.rel_pos_emb = PosEmbedding3D(dim_head, max_freq = pos_max_freq)
+        self.use_absolute = use_absolute
+        self.use_rotary = use_rotary
+
         self.register_count=register_count
 
         self.cls_scan_token = nn.Parameter(torch.randn(1, 1, dim))
@@ -160,6 +160,27 @@ class RvT(nn.Module):
     def forward(self, patches, coords):
 
         x = self.to_patch_embedding(patches)
+        pos_emb_output = self.abs_pos_emb(coords)
+
+        if self.use_absolute:
+            # pos_emb_output is a tuple (sin, cos).
+            # For absolute embeddings, we need to create a single tensor by interleaving sin and cos.
+            sin, cos = pos_emb_output
+
+            # The sin/cos from PosEmbedding3D are repeated for rotary, like [s1, s1, s2, s2, ...].
+            # We "un-repeat" them by taking every second element to get [s1, s2, ...].
+            sin_unrepeated = sin[:, :, 0::2]
+            cos_unrepeated = cos[:, :, 0::2]
+
+            # Interleave them to form a standard sinusoidal embedding: [s1, c1, s2, c2, ...]
+            # The resulting tensor will have the full dimension `dim`.
+            absolute_pos_emb = PosEmbedding3D.interleave_two_tensors(sin_unrepeated, cos_unrepeated)
+
+            # Add the absolute positional embedding directly to the patch embeddings.
+            x = x + absolute_pos_emb
+
+        if self.use_rotary:
+            pos_emb_output = self.rel_pos_emb(coords)
 
         b, n = x.shape[:2]
 
@@ -169,7 +190,8 @@ class RvT(nn.Module):
 
         x = torch.cat((cls_scan_tokens, cls_pos_tokens, register_tokens, x), dim=1)
 
-        x = self.transformer(x, coords, n_non_input_tokens=2+self.register_count)
+
+        x = self.transformer(x, pos_emb_output, n_non_input_tokens=2+self.register_count)
 
         return x
 
@@ -179,7 +201,7 @@ class PosEmbedding3D(nn.Module):
     """
     Generates 3D rotary embeddings from explicit, pre-normalized (y, x, z) coordinates.
     """
-    def __init__(self, dim, max_freq=50):
+    def __init__(self, dim, max_freq=30):
         super().__init__()
 
         assert dim % 6 == 0, 'Rotary dimension `dim` must be divisible by 6 for 3D RoPE.'
