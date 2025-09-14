@@ -19,7 +19,7 @@ with app.setup:
     from rvt_model import RvT, PosEmbedding3D
     from torch.utils.data import DataLoader, IterableDataset
     from typing import Optional, Tuple, Dict, Any
-    from data_loader import zarr_scan
+    from experimental_data_loader import zarr_scan
     from x_transformers import CrossAttender
     import pandas as pd
     import numpy as np
@@ -207,93 +207,93 @@ def _():
 
             return total_loss
 
-        def validation_step(self, batch, batch_idx):
-            # The validation dataloader yields (patches, centers, location)
-            patches, centers, locations = batch
+        # def validation_step(self, batch, batch_idx):
+        #     # The validation dataloader yields (patches, centers, location)
+        #     patches, centers, locations = batch
 
-            # Get the view embedding
-            emb = self.encoder(patches, centers)
-            view_embedding = emb[:, 1]
+        #     # Get the view embedding
+        #     emb = self.encoder(patches, centers)
+        #     view_embedding = emb[:, 1]
 
-            # Store the outputs for later use in `on_validation_epoch_end`
-            # .detach().cpu() is important to avoid GPU memory leaks
-            output = {"embeddings": view_embedding.detach().cpu(), "locations": locations}
-            self.validation_step_outputs.append(output)
-            return output
+        #     # Store the outputs for later use in `on_validation_epoch_end`
+        #     # .detach().cpu() is important to avoid GPU memory leaks
+        #     output = {"embeddings": view_embedding.detach().cpu(), "locations": locations}
+        #     self.validation_step_outputs.append(output)
+        #     return output
 
-        # --- NEW: ON_VALIDATION_EPOCH_END ---
-        def on_validation_epoch_end(self):
-            if not self.validation_step_outputs:
-                print("No validation outputs to process.")
-                return
+        # # --- NEW: ON_VALIDATION_EPOCH_END ---
+        # def on_validation_epoch_end(self):
+        #     if not self.validation_step_outputs:
+        #         print("No validation outputs to process.")
+        #         return
 
-            # --- 1. Aggregate all embeddings and locations from batches ---
-            all_embeddings = torch.cat([x["embeddings"] for x in self.validation_step_outputs]).numpy()
+        #     # --- 1. Aggregate all embeddings and locations from batches ---
+        #     all_embeddings = torch.cat([x["embeddings"] for x in self.validation_step_outputs]).numpy()
 
-            # Locations might be a list of tuples, so we flatten it
-            all_locations = []
-            for x in self.validation_step_outputs:
-                all_locations.extend(x["locations"])
+        #     # Locations might be a list of tuples, so we flatten it
+        #     all_locations = []
+        #     for x in self.validation_step_outputs:
+        #         all_locations.extend(x["locations"])
 
-            # --- 2. Perform Clustering and ARI Calculation (your logic) ---
-            target_locations = ["Left Middle Cerebral Artery", "Right Middle Cerebral Artery"]
-            filtered_indices = [i for i, loc in enumerate(all_locations) if loc in target_locations]
+        #     # --- 2. Perform Clustering and ARI Calculation (your logic) ---
+        #     target_locations = ["Left Middle Cerebral Artery", "Right Middle Cerebral Artery"]
+        #     filtered_indices = [i for i, loc in enumerate(all_locations) if loc in target_locations]
 
-            if not filtered_indices:
-                print("No validation data found for target locations. Skipping ARI calculation.")
-                self.validation_step_outputs.clear()  # IMPORTANT: Clear stored outputs
-                return
+        #     if not filtered_indices:
+        #         print("No validation data found for target locations. Skipping ARI calculation.")
+        #         self.validation_step_outputs.clear()  # IMPORTANT: Clear stored outputs
+        #         return
 
-            filtered_embeddings = all_embeddings[filtered_indices]
-            filtered_locations = [all_locations[i] for i in filtered_indices]
+        #     filtered_embeddings = all_embeddings[filtered_indices]
+        #     filtered_locations = [all_locations[i] for i in filtered_indices]
 
-            # --- 3. Create and Log Visualization to wandb ---
-            pca = PCA(n_components=3)
-            embeddings_3d = pca.fit_transform(filtered_embeddings)
+        #     # --- 3. Create and Log Visualization to wandb ---
+        #     pca = PCA(n_components=3)
+        #     embeddings_3d = pca.fit_transform(filtered_embeddings)
 
-            n_clusters = len(target_locations)
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            cluster_labels = kmeans.fit_predict(embeddings_3d)
+        #     n_clusters = len(target_locations)
+        #     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        #     cluster_labels = kmeans.fit_predict(embeddings_3d)
 
-            ari_score = adjusted_rand_score(filtered_locations, cluster_labels)
+        #     ari_score = adjusted_rand_score(filtered_locations, cluster_labels)
 
-            # Log the ARI score to wandb
-            self.log("val_ari_score", ari_score, prog_bar=True)
-            print(f"Validation ARI Score: {ari_score:.4f}")
+        #     # Log the ARI score to wandb
+        #     self.log("val_ari_score", ari_score, prog_bar=True)
+        #     print(f"Validation ARI Score: {ari_score:.4f}")
 
-            fig = plt.figure(figsize=(20, 9))
-            fig.suptitle(
-                f"Clustering (Step {self.global_step}) - Ground Truth vs. K-Means", fontsize=16
-            )
+        #     fig = plt.figure(figsize=(20, 9))
+        #     fig.suptitle(
+        #         f"Clustering (Step {self.global_step}) - Ground Truth vs. K-Means", fontsize=16
+        #     )
 
-            # Plot 1: Ground Truth
-            ax1 = fig.add_subplot(121, projection="3d")
-            unique_locs = list(set(filtered_locations))
-            color_map = {loc: plt.cm.viridis(i / len(unique_locs)) for i, loc in enumerate(unique_locs)}
-            gt_colors = [color_map[loc] for loc in filtered_locations]
-            ax1.scatter(
-                embeddings_3d[:, 0], embeddings_3d[:, 1], embeddings_3d[:, 2], c=gt_colors, alpha=0.7
-            )
-            ax1.set_title("Ground Truth Labels")
+        #     # Plot 1: Ground Truth
+        #     ax1 = fig.add_subplot(121, projection="3d")
+        #     unique_locs = list(set(filtered_locations))
+        #     color_map = {loc: plt.cm.viridis(i / len(unique_locs)) for i, loc in enumerate(unique_locs)}
+        #     gt_colors = [color_map[loc] for loc in filtered_locations]
+        #     ax1.scatter(
+        #         embeddings_3d[:, 0], embeddings_3d[:, 1], embeddings_3d[:, 2], c=gt_colors, alpha=0.7
+        #     )
+        #     ax1.set_title("Ground Truth Labels")
 
-            # Plot 2: K-Means Predictions
-            ax2 = fig.add_subplot(122, projection="3d")
-            ax2.scatter(
-                embeddings_3d[:, 0],
-                embeddings_3d[:, 1],
-                embeddings_3d[:, 2],
-                c=cluster_labels,
-                cmap="viridis",
-                alpha=0.7,
-            )
-            ax2.set_title(f"K-Means Clusters (ARI: {ari_score:.2f})")
+        #     # Plot 2: K-Means Predictions
+        #     ax2 = fig.add_subplot(122, projection="3d")
+        #     ax2.scatter(
+        #         embeddings_3d[:, 0],
+        #         embeddings_3d[:, 1],
+        #         embeddings_3d[:, 2],
+        #         c=cluster_labels,
+        #         cmap="viridis",
+        #         alpha=0.7,
+        #     )
+        #     ax2.set_title(f"K-Means Clusters (ARI: {ari_score:.2f})")
 
-            # Log the figure to Weights & Biases
-            self.logger.experiment.log({"validation_clusters": wandb.Image(fig)})
-            plt.close(fig)  # Close the figure to free memory
+        #     # Log the figure to Weights & Biases
+        #     self.logger.experiment.log({"validation_clusters": wandb.Image(fig)})
+        #     plt.close(fig)  # Close the figure to free memory
 
-            # --- 4. IMPORTANT: Clear the stored outputs ---
-            self.validation_step_outputs.clear()
+        #     # --- 4. IMPORTANT: Clear the stored outputs ---
+        #     self.validation_step_outputs.clear()
 
         def configure_optimizers(self):
             # Use the learning_rate from hparams so it can be configured by sweeps
@@ -404,13 +404,13 @@ class PrismOrderingDataset(IterableDataset):
 
     def __init__(self, metadata, include_nifti, patch_shape, position_space, n_patches, n_aux_patches, n_sampled_from_same_study, scratch_dir):
         super().__init__()
-        self.metadata = pd.read_parquet('/cbica/home/gangarav/rsna_any/rsna_2025/combined_metadata.parquet')
-        if not include_nifti:
-            self.metadata = self.metadata.query("original_format != 'nifti'")
+        self.metadata = pd.read_parquet('/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet')
 
         self.patch_shape = patch_shape
         self.n_patches = n_patches
         self.n_sampled_from_same_study = n_sampled_from_same_study
+        self.worker_active_sample_pool_size = 75
+        self.n_samples_for_studies_in_the_active_sample_pool = 200
 
         self.position_space=position_space
         self.n_aux_patches=n_aux_patches
@@ -423,7 +423,7 @@ class PrismOrderingDataset(IterableDataset):
     def _stage_data_to_scratch(self, source_path, worker_id):
         """
         Checks for data on scratch and copies it if not present.
-        Handles race conditions with a lock file.
+        FAILS CATASTROPHICALLY on a race condition.
         Returns the path to the data on scratch.
         """
         scan_basename = os.path.basename(source_path)
@@ -438,7 +438,7 @@ class PrismOrderingDataset(IterableDataset):
         # --- Lock file mechanism to prevent race conditions ---
         try:
             # Atomic operation: try to create the lock directory.
-            # If it fails, another worker is already copying.
+            # If it fails, assumption around concurrency is incorrect.
             os.makedirs(lock_path)
 
             print(f"[Worker {worker_id}] Lock acquired. Copying {scan_basename} to scratch...")
@@ -450,23 +450,70 @@ class PrismOrderingDataset(IterableDataset):
             shutil.copytree(source_path, dest_path)
             print(f"[Worker {worker_id}] Copy finished for {scan_basename}.")
 
+            # The worker that acquired the lock must remove it upon success.
+            os.rmdir(lock_path)
+
         except FileExistsError:
-            print(f"[Worker {worker_id}] Waiting for another worker to copy {scan_basename}...")
-            # Wait until the lock file is gone.
-            while os.path.exists(lock_path):
-                time.sleep(2) # Wait for 2 seconds before checking again
-            print(f"[Worker {worker_id}] Lock released for {scan_basename}. Proceeding.")
+            # This block is executed if a race condition is detected.
+            # Instead of waiting, we raise an error to halt the process.
+            error_message = (
+                f"[Worker {worker_id}] FATAL: Race condition detected! "
+                f"The lock file '{lock_path}' already exists. This indicates "
+                f"that your assumption about data splitting is incorrect."
+            )
+            print(error_message)
+            raise RuntimeError(error_message)
 
-        finally:
-            # The worker that acquired the lock must remove it.
-            if os.path.exists(lock_path):
-                os.rmdir(lock_path)
-
-        # Double-check that the data is now there after waiting
+        # This check is now mostly for verifying a successful copy by this worker,
+        # as the waiting logic for other workers has been removed.
         if not os.path.exists(dest_path):
-            raise FileNotFoundError(f"Worker {worker_id} waited for copy, but {dest_path} was not found. The copy may have failed.")
+            raise FileNotFoundError(f"Worker {worker_id} completed the copy, but the destination {dest_path} was not found. The copy may have failed.")
 
         return dest_path
+
+    def _delete_data_from_scratch(self, source_path, worker_id):
+        """
+        Deletes data from the scratch directory.
+        This version is designed to FAIL CATASTROPHICALLY on a race condition.
+        """
+        scan_basename = os.path.basename(source_path)
+        dest_path = os.path.join(self.scratch_dir, scan_basename)
+        lock_path = dest_path + ".lock"
+
+        # If the data is already gone, there's nothing to do.
+        if not os.path.exists(dest_path):
+            raise FileNotFoundError(f"Worker {worker_id} could not find {dest_path}. Someone else must have deleted it.")
+
+        # --- Lock file mechanism to prevent race conditions ---
+        try:
+            # Atomic operation: try to create the lock directory.
+            # If this fails, another worker is busy with this file.
+            os.makedirs(lock_path)
+
+            # This worker now has exclusive access.
+            print(f"[Worker {worker_id}] Lock acquired. Deleting {scan_basename} from scratch...")
+
+            # Check if the data exists before trying to delete it.
+            # It might have been deleted by another worker that just released the lock.
+            if os.path.exists(dest_path):
+                shutil.rmtree(dest_path)
+                print(f"[Worker {worker_id}] Deletion finished for {scan_basename}.")
+            else:
+                print(f"[Worker {worker_id}] Data was already deleted by another process. Cleaning up lock.")
+
+            # The worker that acquired the lock must remove it upon success.
+            os.rmdir(lock_path)
+
+        except FileExistsError:
+            # This block is executed if a race condition is detected.
+            # Another worker is actively copying or deleting this file.
+            error_message = (
+                f"[Worker {worker_id}] FATAL: Race condition detected during deletion! "
+                f"Cannot delete because another worker has a lock on '{dest_path}'."
+            )
+            print(error_message)
+            raise RuntimeError(error_message)
+
 
     def generate_training_pair(self, scan, n_patches: int, position_space = "patient", n_aux_patches: int = 0, debug: bool = False) -> tuple:
         """
@@ -541,9 +588,6 @@ class PrismOrderingDataset(IterableDataset):
         else:
             # Case: num_workers > 0.
             worker_id = worker_info.id
-            # Split the metadata DataFrame among workers.
-            # The slice notation [start:stop:step] is used here.
-            # worker_id::num_workers gives each worker a unique, non-overlapping subset.
             worker_metadata = self.metadata.iloc[worker_id::worker_info.num_workers]
 
             # Seed each worker differently to ensure random shuffling is unique
@@ -553,52 +597,73 @@ class PrismOrderingDataset(IterableDataset):
 
         print(f"[Worker {worker_id}] assigned {len(worker_metadata)} scans.")
 
+        worker_indices = worker_metadata.index.tolist()
+        random.shuffle(worker_indices)
+
+        active_dict = {active_index: self.n_samples_for_studies_in_the_active_sample_pool for active_index in worker_indices[:self.worker_active_sample_pool_size]}
+        inactive_indices = worker_indices[self.worker_active_sample_pool_size:]
+
         while True:
 
-            shuffled_worker_metadata = worker_metadata.sample(frac=1)
+            sampled_index = random.choice(list(active_dict.keys()))
+            active_dict[sampled_index] -= 1
+            sample = worker_metadata.loc[sampled_index]
+            print(f"[Worker {worker_id}] Sampling a study...")
+            source_zarr_path = sample["zarr_path"]
+            print(f"[Worker {worker_id}] Selected scan: {source_zarr_path}")
 
-            for _, sample in shuffled_worker_metadata.iterrows():
-                print(f"[Worker {worker_id}] Sampling a study...")
+            if active_dict[sampled_index] < 0:
+                print(f"[Worker {worker_id}] sampled {source_zarr_path} max times, deleting...")
+                self._delete_data_from_scratch(source_zarr_path, worker_id)
+                del active_dict[sampled_index]
+                inactive_indices.append(sampled_index)
+
+                sampled_index = random.choice(inactive_indices)
+                inactive_indices.remove(sampled_index)
+                active_dict[sampled_index] = self.n_samples_for_studies_in_the_active_sample_pool - 1
+                sample = worker_metadata.loc[sampled_index]
+
+                print(f"[Worker {worker_id}] Sampling a different study...")
                 source_zarr_path = sample["zarr_path"]
                 print(f"[Worker {worker_id}] Selected scan: {source_zarr_path}")
 
-                # --- CORE LOGIC CHANGE ---
-                path_to_load = source_zarr_path
-                if self.scratch_dir:
-                    try:
-                        path_to_load = self._stage_data_to_scratch(source_zarr_path, worker_id)
-                    except (Exception) as e:
-                        print(f"[Worker {worker_id}] CRITICAL: Failed to stage {source_zarr_path} to scratch. Skipping. Error: {e}")
-                        continue
-                # -------------------------
-
-                row_id = sample.name
-                median = sample["median"]
-                stdev = sample["stdev"]
-
-                # 2. Instantiate the scan loader with all necessary info
+            # --- CORE LOGIC CHANGE ---
+            path_to_load = source_zarr_path
+            if self.scratch_dir:
                 try:
-                    scan = zarr_scan(
-                        path_to_scan=path_to_load,
-                        median=median,
-                        stdev=stdev,
-                        patch_shape=self.patch_shape
-                    )
-                except (ValueError, FileNotFoundError) as e:
-                    print(f"[Worker {worker_id}] CRITICAL: Skipping scan {source_zarr_path} due to error: {e}")
+                    path_to_load = self._stage_data_to_scratch(source_zarr_path, worker_id)
+                except (Exception) as e:
+                    print(f"[Worker {worker_id}] CRITICAL: Failed to stage {source_zarr_path} to scratch. Skipping. Error: {e}")
                     continue
+            # -------------------------
+
+            row_id = sample.name
+            median = sample["median"]
+            stdev = sample["stdev"]
+
+            # 2. Instantiate the scan loader with all necessary info
+            try:
+                scan = zarr_scan(
+                    path_to_scan=path_to_load,
+                    median=median,
+                    stdev=stdev,
+                    patch_shape=self.patch_shape
+                )
+            except (ValueError, FileNotFoundError) as e:
+                print(f"[Worker {worker_id}] CRITICAL: Skipping scan {source_zarr_path} due to error: {e}")
+                continue
 
 
-                print(f"[Worker {worker_id}] Generating pairs for {source_zarr_path}...")
-                for _ in range(self.n_sampled_from_same_study):
-                    training_pair = self.generate_training_pair(
-                        scan,
-                        n_patches=self.n_patches,
-                        position_space=self.position_space,
-                        n_aux_patches=self.n_aux_patches
-                    )
+            print(f"[Worker {worker_id}] Generating pairs for {source_zarr_path}...")
+            for _ in range(self.n_sampled_from_same_study):
+                training_pair = self.generate_training_pair(
+                    scan,
+                    n_patches=self.n_patches,
+                    position_space=self.position_space,
+                    n_aux_patches=self.n_aux_patches
+                )
 
-                    yield (*training_pair, row_id)
+                yield (*training_pair, row_id)
 
 
 @app.class_definition
@@ -650,6 +715,31 @@ class ValidationDataset(IterableDataset):
 
 @app.cell
 def _(RadiographyEncoder):
+    def get_allocated_cpus():
+        """
+        Gets the number of CPUs allocated to the job.
+        It checks for common environment variables set by cluster schedulers.
+        If not found, it falls back to the total number of CPUs on the machine.
+        """
+        # Check for Slurm
+        return int(os.environ.get("SLURM_CPUS_PER_GPU"))
+
+    def get_gpu_memory_gb():
+        """
+        Gets the total memory of the first available GPU in gigabytes.
+        Returns a dictionary where keys are device IDs and values are memory in GB.
+        Returns an empty dictionary if no GPU is found.
+        """
+        gpu_memory = {}
+        if not torch.cuda.is_available():
+            return gpu_memory
+
+        for i in range(torch.cuda.device_count()):
+            total_mem_bytes = torch.cuda.get_device_properties(i).total_memory
+            total_mem_gb = round(total_mem_bytes / (1024**3), 2) # Convert bytes to GiB
+            gpu_memory[i] = total_mem_gb
+        return gpu_memory
+
     def train_run(default_config=None):
         """
         Main training function that can be called by a sweep agent or for a single run.
@@ -703,9 +793,10 @@ def _(RadiographyEncoder):
         # --- 4. Setup Data ---
         PATCH_SHAPE = (1, 16, 16)
         N_PATCHES = 64
-        NUM_WORKERS = 10
-        METADATA_PATH = '/cbica/home/gangarav/rsna_any/rsna_2025/combined_metadata.parquet'
-        scratch_dir = os.environ.get('TMP')
+        NUM_WORKERS = int(get_allocated_cpus()*0.8)
+        METADATA_PATH = '/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet'
+        scratch_dir = os.environ.get('TMP') + "/scans"
+
         if scratch_dir is None:
             # If the variable isn't set, raise an error or use a default.
             # For a cluster job, it's better to fail loudly.
@@ -724,23 +815,24 @@ def _(RadiographyEncoder):
         )
         dataloader = DataLoader(
             dataset,
-            batch_size=cfg.batch_size,
-            num_workers=NUM_WORKERS,
+            batch_size=int(cfg.batch_size * (get_gpu_memory_gb()[0]/80.0)),
+            num_workers=int(NUM_WORKERS * 0.8),
             persistent_workers=(NUM_WORKERS > 0),
             pin_memory=True,
         )
 
-        val_dataset = ValidationDataset(
-            patch_shape=PATCH_SHAPE,
-            n_patches=N_PATCHES
-        )
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=cfg.batch_size * 2, # Can often use a larger batch size for validation
-            num_workers=2,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+
+        # val_dataset = ValidationDataset(
+        #     patch_shape=PATCH_SHAPE,
+        #     n_patches=N_PATCHES
+        # )
+        # val_dataloader = DataLoader(
+        #     val_dataset,
+        #     batch_size=cfg.batch_size * 2, # Can often use a larger batch size for validation
+        #     num_workers=2,
+        #     persistent_workers=True,
+        #     pin_memory=True,
+        # )
 
         # --- 5. Setup Callbacks and Logger ---
         # The logger will automatically use the run initialized by wandb.init()
@@ -762,11 +854,11 @@ def _(RadiographyEncoder):
             max_epochs=-1, # For iterable datasets, steps are better than epochs
             max_steps=5000000, # Example: set a max number of steps
             callbacks=[checkpoint_callback],
-            accumulate_grad_batches=10,
+            accumulate_grad_batches=int(80.0/get_gpu_memory_gb()[0]),
             logger=wandb_logger,
             log_every_n_steps=25,
-            val_check_interval=5000,
-            num_sanity_val_steps=0,
+            #val_check_interval=5000,
+            #num_sanity_val_steps=0,
         )
 
         # --- 7. Start Training ---
@@ -775,7 +867,7 @@ def _(RadiographyEncoder):
         trainer.fit(
             model=model,
             train_dataloaders=dataloader,
-            val_dataloaders=val_dataloader,
+            # val_dataloaders=val_dataloader,
             ckpt_path=ckpt_path
         )
 
@@ -820,6 +912,28 @@ def _(train_run):
         'scan_contrastive_objective': True,
         'mim_objective': False,
     }
+
+    def _make_sure_scratch_is_clean():
+        scratch_dir = os.environ.get('TMP') + "/scans"
+        if scratch_dir and os.path.exists(scratch_dir):
+            total_size = 0
+            for root, dirs, files in os.walk(scratch_dir):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    total_size += os.path.getsize(fp)
+            print(f"Scratch directory size: {total_size / (1024**2):.2f} MB")
+            print("First few entries in scratch:")
+            for name in sorted(os.listdir(scratch_dir))[:5]:
+                print("  ", name)
+            for name in os.listdir(scratch_dir):
+                path = os.path.join(scratch_dir, name)
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+            print("Cleared scratch directory contents.")
+
+    _make_sure_scratch_is_clean()
     train_run() #default_config=default_config)
     return
 

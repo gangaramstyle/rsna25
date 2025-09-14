@@ -25,9 +25,12 @@ with app.setup:
 
 @app.cell
 def _():
-    metadata_df = pd.read_parquet('/cbica/home/gangarav/rsna_any/rsna_2025/combined_metadata.parquet')
+    metadata_df = pd.read_parquet('/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet')
+
     #pd.read_parquet('/cbica/home/gangarav/rsna25/aneurysm_labels_cleaned_6_64_64.parquet')
     metadata_df = metadata_df[metadata_df['series_uid'] != '1.2.826.0.1.3680043.8.498.40511751565674479940947446050421785002']
+    metadata_df = metadata_df[metadata_df['patient_id'].notnull()]
+    metadata_df = metadata_df[~metadata_df['series_uid'].str.contains('dwi', case=False, na=False)]
     table = mo.ui.table(metadata_df, selection='single')
 
     table
@@ -73,11 +76,6 @@ def _(
 
 @app.cell
 def _():
-    return
-
-
-@app.cell
-def _():
     # dim = 6*100
     # model = PosEmbedding3D(dim, max_freq=3)
 
@@ -108,24 +106,18 @@ def _(sample):
 
 
 @app.cell
-def _(sample):
-    sample
-    return
-
-
-@app.cell
 def _(sample, scan_pixels, slider):
     patches_for_display = sample["normalized_patches"].squeeze()
     patches_for_display[:,0,:] = -1
     patches_for_display[:,:,0] = 1
 
     mo.hstack([
-        mo.image(scan_pixels[slider.value], width=512),
+        mo.image(np.flipud(scan_pixels[slider.value]), height=512),
         mo.image(rearrange(
             patches_for_display,
             '(h_grid w_grid) h w -> (h_grid h) (w_grid w)',
-            h_grid=8
-        ), width=512)
+            h_grid=2
+        ), height=512)
     ])
     return
 
@@ -133,7 +125,6 @@ def _(sample, scan_pixels, slider):
 @app.cell
 def _(patch_shape, sample, scan):
     scan_pixels = scan.normalize_pixels_to_range(scan.get_scan_array_copy(), sample["wc"] - 0.5*sample["ww"], sample["wc"] + 0.5*sample["ww"])
-    scan
 
     scan_pixels = scan.create_rgb_scan_with_boxes(
         scan_pixels,
@@ -150,16 +141,46 @@ def _(patch_shape, sample, scan):
         (0, 100, 0)
     )
 
+    POINT_SIZE=2
+    p1_r = mo.ui.slider(start=POINT_SIZE, stop=scan_pixels.shape[1]-1-POINT_SIZE)
+    p1_c = mo.ui.slider(start=POINT_SIZE, stop=scan_pixels.shape[2]-1-POINT_SIZE)
+
     slider = mo.ui.slider(start=0, stop=scan_pixels.shape[0]-1,value=int(sample["subset_center_idx"][0,0]))
-    slider
-    return scan_pixels, slider
+    mo.vstack([
+        slider,
+        p1_r,
+        p1_c,
+    ])
+    return POINT_SIZE, p1_c, p1_r, scan_pixels, slider
+
+
+@app.cell
+def _(POINT_SIZE, p1_c, p1_r, sample, scan, scan_pixels, slider):
+    # Create slice tuples for the point marker
+    point_slices = [slice(None)] * 3
+    point_slices[0] = slider.value
+    point_slices[1] = slice(p1_r.value - POINT_SIZE, p1_r.value + POINT_SIZE)
+    point_slices[2] = slice(p1_c.value - POINT_SIZE, p1_c.value + POINT_SIZE)
+
+    drawn = scan_pixels[:].copy()
+    drawn[tuple(point_slices)] = [256, 0, 0]
+
+    point = np.array([slider.value, p1_r.value, p1_c.value])
+    mo.hstack([
+        mo.vstack([
+            mo.image(np.flipud(drawn[slider.value]), width=512),
+            scan.convert_indices_to_patient_space(point)
+        ]),
+        sample
+    ])
+    return
 
 
 @app.cell
 def _(sample):
     pos_emb = PosEmbedding3D(600, max_freq = 30)
     coords = torch.from_numpy(sample["patch_centers_pt"] - sample["subset_center_pt"]).unsqueeze(0).to(torch.float32)
-    print(coords)
+
     sin, cos = pos_emb(torch.asinh(coords))
     mo.vstack([
         mo.image(src=sin[0]),
@@ -177,11 +198,59 @@ def _(coords):
 @app.class_definition
 class zarr_scan():
 
+    def convert_to_scrollable_coordinates(self, coordinates):
+        if self.scrollable_axis == 0:  # sagittal
+            axes = [0, 2, 1]
+        elif self.scrollable_axis == 1:  # coronal
+            axes = [1, 2, 0]
+        else:  # axial
+            axes = [2, 1, 0]
+
+        # Handle numpy arrays, torch tensors, and regular lists/tuples
+        if hasattr(coordinates, 'transpose'):
+            # For numpy arrays and torch tensors
+            return coordinates[..., axes]
+            # return coordinates.transpose(*axes)
+        else:
+            # For regular Python sequences
+            return type(coordinates)(coordinates[i] for i in axes)
+
+    def convert_from_scrollable_coordinates(self, coordinates):
+        if self.scrollable_axis == 0:  # sagittal
+            axes = [0, 2, 1]
+        elif self.scrollable_axis == 1:  # coronal
+            axes = [2, 0, 1]
+        else:  # axial
+            axes = [2, 1, 0]
+
+        # Handle numpy arrays, torch tensors, and regular lists/tuples
+        if hasattr(coordinates, 'transpose'):
+            # For numpy arrays and torch tensors
+            return coordinates[..., axes]
+            # return coordinates.transpose(*axes)
+        else:
+            # For regular Python sequences
+            return type(coordinates)(coordinates[i] for i in axes)    
+
+
     def __init__(self, path_to_scan, median, stdev, patch_shape=(1, 16, 16)):
         self.zarr_store = zarr.open(path_to_scan, mode='r')
         self.patch_shape = np.array(patch_shape)
         self.med = median
         self.std = stdev
+
+        attrs = self.zarr_store.attrs
+        arr_shape = [attrs["shape_RL"], attrs["shape_PA"], attrs["shape_IS"]]
+        self.scrollable_axis = np.argmax(np.abs(arr_shape - np.mean(arr_shape)))
+
+        if self.scrollable_axis == 0: #sagittal
+            axes = [0, 2, 1]
+        elif self.scrollable_axis == 1: # coronal
+            axes = [1, 2, 0]
+        else: # axial
+            axes = [2, 1, 0]
+
+        self.scrollable_arr_shape = tuple(arr_shape[i] for i in axes)
 
     # def generate_training_pair(self, n_patches: int, to_torch: bool = True) -> tuple:
     #     """
@@ -275,7 +344,32 @@ class zarr_scan():
         return results
 
     def get_scan_array_copy(self):
-        return self.zarr_store['pixel_data'][:]
+
+        if self.scrollable_axis == 0:  # sagittal
+            axes = [0, 2, 1]
+        elif self.scrollable_axis == 1:  # coronal
+            axes = [1, 2, 0]
+        else:  # axial
+            axes = [2, 1, 0]
+
+
+        # 1. Get the axes for the transpose operation (must be positive)
+        transpose_axes = [abs(ax) for ax in axes]
+
+        # 2. Get the new axes that need to be flipped (the indices of negative numbers)
+        flip_axes = [i for i, ax in enumerate(axes) if ax < 0]
+
+        # 3. Get the data from storage
+        scan_data = self.zarr_store['pixel_data'][:]
+
+        # 4. Perform the transposition first
+        transposed_data = scan_data.transpose(transpose_axes)
+
+        # 5. If any axes were marked for flipping, flip them now
+        if flip_axes:
+            return np.flip(transposed_data, axis=tuple(flip_axes))
+        else:
+            return transposed_data
 
     def create_rgb_scan_with_boxes(
         self,
@@ -345,7 +439,7 @@ class zarr_scan():
         number of patches requested. The volume of the subset will be approximately
         n_patches * patch_volume, while respecting min/max shape constraints.
         """
-        array_shape = np.array(self.zarr_store['pixel_data'].shape)
+        array_shape = self.scrollable_arr_shape
 
         if not all(array_shape >= self.patch_shape):
             raise ValueError("array_shape must be larger than or equal to patch_shape in all dimensions.")
@@ -505,7 +599,7 @@ class zarr_scan():
         ### NEW
 
         unclamped_absolute_starts = np.array(subset_start) + relative_starts
-        max_scan_start = np.array(self.zarr_store["pixel_data"].shape) - np.array(self.patch_shape)
+        max_scan_start = np.array(self.scrollable_arr_shape) - np.array(self.patch_shape)
         max_scan_start = np.maximum(0, max_scan_start) # Ensure it's not negative
         clamped_absolute_starts = np.clip(unclamped_absolute_starts, 0, max_scan_start)
 
@@ -554,7 +648,9 @@ class zarr_scan():
 
     def get_patches_from_indices(self, patch_indices):
         n_patches = patch_indices.shape[0]
-        patch_d, patch_r, patch_c = self.patch_shape
+        patch_d, patch_r, patch_c = self.convert_from_scrollable_coordinates(self.patch_shape)
+
+        patch_indices = self.convert_from_scrollable_coordinates(patch_indices)
 
         # --- Step 1: Calculate the bounding box for all patches ---
         # Find the top-left-front corner of the entire region
@@ -575,7 +671,7 @@ class zarr_scan():
 
         # --- Step 3: Extract individual patches from the in-memory super_patch ---
         # Pre-allocate the final array for efficiency
-        patches = np.empty((n_patches, patch_d, patch_r, patch_c), dtype=super_patch.dtype)
+        patches = np.empty((n_patches, 1, 16, 16), dtype=super_patch.dtype)
 
         for i, (d, r, c) in enumerate(patch_indices):
             # Calculate the patch's position *relative* to the super_patch's origin
@@ -586,7 +682,7 @@ class zarr_scan():
                 d_rel : d_rel + patch_d,
                 r_rel : r_rel + patch_r,
                 c_rel : c_rel + patch_c
-            ]
+            ].flatten().reshape(1, 16, 16)
 
         return patches
 
@@ -595,41 +691,42 @@ class zarr_scan():
 
         if len(affine_matrices.shape) == 2:
             # the source data is likely a nifti and just use the singular 4x4 matrix for the transform
+            voxel_indices = self.convert_from_scrollable_coordinates(voxel_indices)
             patient_coords = nib.affines.apply_affine(affine_matrices, voxel_indices)
-            print(patient_coords.shape)
-        else:
-            # 1. Get the slice index 'd' for each point.
-            slice_indices = voxel_indices[:, 0].astype(int)
+        #     print(patient_coords.shape)
+        # else:
+        #     # 1. Get the slice index 'd' for each point.
+        #     slice_indices = voxel_indices[:, 0].astype(int)
 
-            # 2. Select the specific 4x4 affine matrix for each point's slice.
-            # This results in a stack of shape (N, 4, 4).
-            selected_affines = affine_matrices[slice_indices]
+        #     # 2. Select the specific 4x4 affine matrix for each point's slice.
+        #     # This results in a stack of shape (N, 4, 4).
+        #     selected_affines = affine_matrices[slice_indices]
 
-            # 3. Get the in-plane row and column indices (r, c).
-            coords_rc = voxel_indices[:, 1:]  # Shape: (N, 2)
+        #     # 3. Get the in-plane row and column indices (r, c).
+        #     coords_rc = voxel_indices[:, 1:]  # Shape: (N, 2)
 
-            # 4. Construct the 4-element homogeneous voxel coordinates [r, c, 0, 1].
-            # The '0' indicates the position is on the 2D plane itself.
-            # The '1' is the homogeneous coordinate.
-            num_points = voxel_indices.shape[0]
-            zeros_col = np.zeros((num_points, 1))
-            ones_col = np.ones((num_points, 1))
+        #     # 4. Construct the 4-element homogeneous voxel coordinates [r, c, 0, 1].
+        #     # The '0' indicates the position is on the 2D plane itself.
+        #     # The '1' is the homogeneous coordinate.
+        #     num_points = voxel_indices.shape[0]
+        #     zeros_col = np.zeros((num_points, 1))
+        #     ones_col = np.ones((num_points, 1))
 
-            # We construct the vector [r, c, 0, 1] because our affine matrix was built
-            # with column 0 for 'r' steps and column 1 for 'c' steps.
-            homogeneous_coords = np.hstack([coords_rc, zeros_col, ones_col]) # Shape: (N, 4)
+        #     # We construct the vector [r, c, 0, 1] because our affine matrix was built
+        #     # with column 0 for 'r' steps and column 1 for 'c' steps.
+        #     homogeneous_coords = np.hstack([coords_rc, zeros_col, ones_col]) # Shape: (N, 4)
 
-            # 5. Perform batched matrix multiplication.
-            # We need to reshape homogeneous_coords for matmul: (N, 4) -> (N, 4, 1)
-            # The operation is: (N, 4, 4) @ (N, 4, 1) -> (N, 4, 1)
-            patient_coords_homogeneous = np.matmul(
-                selected_affines,
-                homogeneous_coords[:, :, np.newaxis]
-            )
+        #     # 5. Perform batched matrix multiplication.
+        #     # We need to reshape homogeneous_coords for matmul: (N, 4) -> (N, 4, 1)
+        #     # The operation is: (N, 4, 4) @ (N, 4, 1) -> (N, 4, 1)
+        #     patient_coords_homogeneous = np.matmul(
+        #         selected_affines,
+        #         homogeneous_coords[:, :, np.newaxis]
+        #     )
 
-            # 6. Squeeze the result and extract the (x, y, z) components.
-            # The result is (N, 4, 1), squeeze to (N, 4), then take the first 3 columns.
-            patient_coords = patient_coords_homogeneous.squeeze(axis=2)[:, :3]
+        #     # 6. Squeeze the result and extract the (x, y, z) components.
+        #     # The result is (N, 4, 1), squeeze to (N, 4), then take the first 3 columns.
+        #     patient_coords = patient_coords_homogeneous.squeeze(axis=2)[:, :3]
         return patient_coords/10
 
 

@@ -18,13 +18,13 @@ parameters:
   mlp_dim:
     values: [512, 768]
   batch_size:
-    values: [128, 256]
+    values: [1024, 1536, 2048]
   n_registers:
     values: [4, 8, 12]
   pos_objective_mode:
     values: ['classification']
   position_space:
-    values: ['patient', 'pixel']
+    values: ['patient']
   n_aux_patches:
     values: [0, 4, 8]
   window_objective:
@@ -38,11 +38,11 @@ parameters:
   use_rotary:
     values: [true, false]
   use_absolute:
-    values: [true, false]
+    values: [true]
   max_freq:
     values: [14, 30, 45]
   include_nifti:
-    values: [true, false]
+    values: [true]
 
 command:
   - ${env}
