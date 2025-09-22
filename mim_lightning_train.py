@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.15.2"
+__generated_with = "0.14.16"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -410,7 +410,7 @@ class PrismOrderingDataset(IterableDataset):
 
     def __init__(self, metadata, include_nifti, patch_shape, position_space, n_patches, n_aux_patches, n_sampled_from_same_study, scratch_dir):
         super().__init__()
-        self.metadata = pd.read_parquet('/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet')
+        self.metadata = pd.read_parquet('/gs/gsfs0/users/kaijones/datasets/rsna25_data/nifti_combined_metadata.parquet').dropna()
 
         self.patch_shape = patch_shape
         self.n_patches = n_patches
@@ -649,6 +649,8 @@ class PrismOrderingDataset(IterableDataset):
 
             # 2. Instantiate the scan loader with all necessary info
             try:
+                print(path_to_load)
+
                 scan = zarr_scan(
                     path_to_scan=path_to_load,
                     median=median,
@@ -797,11 +799,11 @@ def _():
         )
 
         # --- 4. Setup Data ---
-        PATCH_SHAPE = (1, 8, 8)
+        PATCH_SHAPE = (1, 12, 12)
         N_PATCHES = 64
         NUM_WORKERS = int(get_allocated_cpus())-2
-        METADATA_PATH = '/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet'
-        scratch_dir = os.environ.get('TMP') + "/scans"
+        METADATA_PATH = '/gs/gsfs0/users/kaijones/datasets/rsna25_data/nifti_combined_metadata.parquet'
+        scratch_dir = os.environ.get('TMPDIR') + "/scans"
 
         if scratch_dir is None:
             # If the variable isn't set, raise an error or use a default.
@@ -842,15 +844,12 @@ def _():
 
         # --- 5. Setup Callbacks and Logger ---
         # The logger will automatically use the run initialized by wandb.init()
-        wandb_logger = WandbLogger(project="rsna25-prism-ordering", log_model=False)
+        wandb_logger = WandbLogger(project="rsna25-prism-ordering", log_model=True)
 
         # Checkpoints are saved in a directory named after the unique wandb run ID
         checkpoint_callback = ModelCheckpoint(
             dirpath=checkpoint_dir,
             filename='{step}',
-            save_top_k=3,
-            monitor='loss',
-            mode='min',
             every_n_train_steps=5000,
             save_last=True,
         )
@@ -920,7 +919,7 @@ def _(train_run):
     }
 
     def _make_sure_scratch_is_clean():
-        scratch_dir = os.environ.get('TMP') + "/scans"
+        scratch_dir = os.environ.get('TMPDIR') + "/scans"
         if scratch_dir and os.path.exists(scratch_dir):
             total_size = 0
             for root, dirs, files in os.walk(scratch_dir):
