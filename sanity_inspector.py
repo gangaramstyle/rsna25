@@ -15,8 +15,8 @@ def _():
     from sklearn.decomposition import PCA
     from sklearn.cluster import KMeans
     from sklearn.metrics import adjusted_rand_score
-    from data_loader import zarr_scan
-    from lightning_train import RadiographyEncoder
+    from experimental_data_loader import zarr_scan
+    from mim_lightning_train import RadiographyEncoder
     import torch.nn.functional as F
     from torch.utils.data import DataLoader, IterableDataset
     import altair as alt
@@ -40,7 +40,7 @@ def _(RadiographyEncoder, mo, os, torch):
 
     # Input for the user to provide the wandb Run ID
     run_id_input = mo.ui.text(
-        value="30bqtiji", # A default value to start with
+        value="ky3ve0kt", # A default value to start with
         label="Enter `wandb` Run ID:"
     )
 
@@ -89,8 +89,11 @@ def _(get_model, run_id_input):
 
 @app.cell
 def _(mo, pd):
-    metadata_df = pd.read_parquet('/cbica/home/gangarav/rsna25/aneurysm_labels_cleaned_6_64_64.parquet')
-    metadata_df = metadata_df[metadata_df['SeriesInstanceUID'] != '1.2.826.0.1.3680043.8.498.40511751565674479940947446050421785002']
+    metadata_df = pd.read_parquet('/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet')
+    aneurysm_df = pd.read_parquet("aneurysm_labels_with_nifti_coords.parquet")
+
+    aneurysm_subset = aneurysm_df[['SeriesInstanceUID', 'location', 'modality', 'image_position_delta_X', 'image_position_delta_Y', 'image_position_delta_Z', 'pixel_x', 'pixel_y', 'pixel_z']]
+    metadata_df = metadata_df.merge(aneurysm_subset, left_on='series_uid', right_on='SeriesInstanceUID', how='inner')
     scan_table = mo.ui.table(metadata_df, page_size=10)
 
     run_button = mo.ui.run_button(label="Generate and Compare Embeddings")
@@ -98,7 +101,7 @@ def _(mo, pd):
         scan_table,
         run_button
     ])
-    return run_button, scan_table
+    return metadata_df, run_button, scan_table
 
 
 @app.cell
@@ -113,14 +116,14 @@ def _(np):
     #         path_to_scan=selected_row["zarr_path"],
     #         median=selected_row["median"],
     #         stdev=selected_row["stdev"],
-    #         patch_shape=PATCH_SHAPE
+    #         patch_shape=(1, 16, 16)
     #     )
     # else:
     #     scan = None
     #     selected_row = None
 
     # mo.md(f"**Scan Loaded:** `{os.path.basename(selected_row['zarr_path'])}`")
-    return N_PATCHES, PATCH_SHAPE, PRISM_SHAPE
+    return N_PATCHES, PATCH_SHAPE
 
 
 @app.cell
@@ -163,6 +166,8 @@ def _(
     IterableDataset,
     N_PATCHES,
     PATCH_SHAPE,
+    metadata_row,
+    n_patches,
     scan_table,
     torch,
     zarr_scan,
@@ -184,57 +189,56 @@ def _(
         def __iter__(self):
             """Yield both aneurysm-centered and random patches for each scan."""
             for _, row in self.metadata.iterrows():
-                try:
-                    # Extract scan information
-                    zarr_path = row["zarr_path"]
-                    median = row["median"]
-                    stdev = row["stdev"]
-                    z, y, x = row['aneurysm_z'], row['aneurysm_y'], row['aneurysm_x']
-                    location = row['location']
+                # try:
+                # Extract scan information
+                zarr_path = row["zarr_path"]
+                median = row["median"]
+                stdev = row["stdev"]
+                z, y, x = row['pixel_x'], row['pixel_y'], row['pixel_z']
+                location = row['location']
 
-                    # Load scan
-                    scan = zarr_scan(
-                        path_to_scan=zarr_path,
-                        median=median,
-                        stdev=stdev,
-                        patch_shape=self.patch_shape
+                scan = zarr_scan(
+                    path_to_scan=row["zarr_path"], 
+                    median=row["median"],
+                    stdev=row["stdev"],
+                    patch_shape=self.patch_shape
+                )
+            
+                sample = scan.train_sample(n_patches, subset_center=(metadata_row["pixel_x"].values[0], metadata_row["pixel_y"].values[0], metadata_row["pixel_z"].values[0]))
+
+                for w_id in range(self.n_windows):
+
+                    # Yield aneurysm-centered patches
+                    sample = scan.train_sample(
+                        n_patches=self.n_patches,
+                        subset_center=(z, y, x),
                     )
 
-                    for w_id in range(self.n_windows):
+                    patches = torch.from_numpy(sample["normalized_patches"]).float()
+                    patch_coords = torch.from_numpy(sample['patch_centers_pt'] - sample['subset_center_pt']).float()
 
-                        # Yield aneurysm-centered patches
+                    yield patches, patch_coords, location, zarr_path, sample['wc'], sample['ww'], sample['subset_start'][0], sample['subset_start'][1], sample['subset_start'][2], sample['subset_shape'][0], sample['subset_shape'][1], sample['subset_shape'][2], scan.scrollable_axis
+
+                    for r_id in range(self.n_repeated):
+                        # Yield random patches for comparison
                         sample = scan.train_sample(
                             n_patches=self.n_patches,
-                            subset_start=(z - self.prism_shape[0] / 2, y - self.prism_shape[1] / 2, x - self.prism_shape[2] / 2),
-                            subset_shape=self.prism_shape,
                         )
 
                         patches = torch.from_numpy(sample["normalized_patches"]).float()
                         patch_coords = torch.from_numpy(sample['patch_centers_pt'] - sample['subset_center_pt']).float()
 
-                        yield patches, patch_coords, location, zarr_path, sample['wc'], sample['ww'], sample['subset_start'][0], sample['subset_start'][1], sample['subset_start'][2], sample['subset_center_pt'][0][0], sample['subset_center_pt'][0][1], sample['subset_center_pt'][0][2]
+                        yield patches, patch_coords, "random", zarr_path, sample['wc'], sample['ww'], sample['subset_start'][0], sample['subset_start'][1], sample['subset_start'][2], sample['subset_shape'][0], sample['subset_shape'][1], sample['subset_shape'][2], scan.scrollable_axis
 
-                        for r_id in range(self.n_repeated):
-                            # Yield random patches for comparison
-                            sample = scan.train_sample(
-                                n_patches=self.n_patches,
-                                subset_shape=self.prism_shape,
-                            )
-
-                            patches = torch.from_numpy(sample["normalized_patches"]).float()
-                            patch_coords = torch.from_numpy(sample['patch_centers_pt'] - sample['subset_center_pt']).float()
-
-                            yield patches, patch_coords, "random", zarr_path, sample['wc'], sample['ww'], sample['subset_start'][0], sample['subset_start'][1], sample['subset_start'][2], sample['subset_center_pt'][0][0], sample['subset_center_pt'][0][1], sample['subset_center_pt'][0][2]
-
-                except Exception as e:
-                    print(f"Skipping sample due to error: {e} in {row.get('zarr_path', 'N/A')}")
-                    continue
+                # except Exception as e:
+                #     print(f"Skipping sample due to error: {e} in {row.get('zarr_path', 'N/A')}")
+                #     continue
 
     interactive_dataset = InteractiveDataset(
         patch_shape=PATCH_SHAPE,
         n_patches=N_PATCHES,
-        n_windows=10,
-        n_repeated=10
+        n_windows=2,
+        n_repeated=2
     )
 
     interactive_loader = DataLoader(
@@ -250,8 +254,7 @@ def _(interactive_loader, model, pd, run_button, torch):
     device = next(model.parameters()).device
     results = []
     if run_button.value:
-        for patches, patch_coords, location, zarr_path, wc, ww, prism_start_z, prism_start_y, prism_start_x, subset_center_z, subset_center_y, subset_center_x in interactive_loader:
-
+        for patches, patch_coords, location, zarr_path, wc, ww, prism_start_z, prism_start_y, prism_start_x, subset_center_z, subset_center_y, subset_center_x, scrollable_axis in interactive_loader:
             patches = patches.to(device)
             patch_coords = patch_coords.to(device)
 
@@ -260,6 +263,7 @@ def _(interactive_loader, model, pd, run_button, torch):
 
             # Convert to numpy for easier handling
             embeddings_np = embeddings.cpu().numpy()
+            scrollable_axis = scrollable_axis.cpu().numpy()
 
             # Create DataFrame with proper lengths
             batch_results = pd.DataFrame({
@@ -274,6 +278,7 @@ def _(interactive_loader, model, pd, run_button, torch):
                 'subset_center_z': [float(_z) for _z in subset_center_z],
                 'subset_center_y': [float(_y) for _y in subset_center_y],
                 'subset_center_x': [float(_x) for _x in subset_center_x],
+                'scrollable_axis': list(scrollable_axis)
             })
             results.append(batch_results)
 
@@ -341,93 +346,148 @@ def _(chart, mo, results_df):
     filtered_results_df = results_df[results_df['zarr'] == selected_zarr].copy()
     prism_table = mo.ui.table(filtered_results_df, selection="single")
     prism_table
-    return filtered_results_df, prism_table
+    return filtered_results_df, prism_table, selected_zarr
 
 
 @app.cell
-def _(PATCH_SHAPE, PRISM_SHAPE, chart, mo, np, prism_table, zarr_scan):
+def _(chart, metadata_df, prism_table, selected_zarr, zarr_scan):
     # Create visualization using your class method
     selected_plot_df = chart.value.iloc[0]
     comparison_prism = prism_table.value.iloc[0]
+    original_row = metadata_df[metadata_df['zarr_path'] == selected_zarr].iloc[0]
+
 
     # Load the scan for the selected row
     scan = zarr_scan(
         path_to_scan=selected_plot_df["zarr"],
-        median=selected_plot_df["wc"],
-        stdev=selected_plot_df["ww"],
-        patch_shape=PATCH_SHAPE
+        median=original_row["median"],
+        stdev=original_row["stdev"],
+        patch_shape=(1, 16, 16)
     )
 
-    # Get normalized scan pixels
-    scan_pixels = scan.get_scan_array_copy()
-    scan_pixels_norm = scan.normalize_pixels_to_range(
-        scan_pixels, 
-        selected_plot_df["wc"], 
-        selected_plot_df["ww"], 
-        out_range=(0, 1)
-    )
+    scan_pixels = scan.normalize_pixels_to_range(scan.get_scan_array_copy(), selected_plot_df["wc"] - 0.5*selected_plot_df["ww"], selected_plot_df["wc"] + 0.5*selected_plot_df["ww"])
 
-    # Calculate prism start coordinates (center - half prism shape)
-    prism_start = np.array([
-        selected_plot_df["prism_start_z"],
-        selected_plot_df["prism_start_y"],
-        selected_plot_df["prism_start_x"]
-    ])
-
-    # Create visualization with the selected prism
-    viz_scan = scan.create_rgb_scan_with_boxes(
-        scan_pixels_norm, 
-        [prism_start.astype(int)], 
-        PRISM_SHAPE, 
-        color=(200, 0, 0)
-    )
-
-    # Calculate prism start coordinates (center - half prism shape)
-    prism_start = np.array([
-        comparison_prism["prism_start_z"],
-        comparison_prism["prism_start_y"],
-        comparison_prism["prism_start_x"]
-    ])
-
-    # Create visualization with the selected prism
-    viz_scan = scan.create_rgb_scan_with_boxes(
-        viz_scan, 
-        [prism_start.astype(int)], 
-        PRISM_SHAPE, 
-        color=(0, 200, 0)
+    scan_pixels = scan.create_rgb_scan_with_boxes(
+        scan_pixels,
+        [
+            (
+                int(selected_plot_df["prism_start_z"]),
+                int(selected_plot_df["prism_start_y"]),
+                int(selected_plot_df["prism_start_x"])
+            )
+        ],
+        [
+            int(selected_plot_df["subset_center_z"]),
+            int(selected_plot_df["subset_center_y"]),
+            int(selected_plot_df["subset_center_x"])
+        ],
+        None,
+        (0, 200, 0)
     )
 
 
-    viz_slider = mo.ui.slider(0, viz_scan.shape[0] - 1, value=selected_plot_df["prism_start_z"])
-    viz_slider
-    return (
-        comparison_prism,
-        prism_start,
-        selected_plot_df,
-        viz_scan,
-        viz_slider,
-    )
+    if scan.scrollable_axis == 0:  # sagittal
+        axes = [0, 2, 1, 3]
+    elif scan.scrollable_axis == 1:  # coronal
+        axes = [1, 2, 0, 3]
+    else:  # axial
+        axes = [2, 1, 0, 3]
+
+    scan_pixels = scan_pixels.transpose(axes)
+
+    # if scan.scrollable_axis == 0:  # sagittal
+    #     d = slider_RL.value
+    #     r = slider_IS.value
+    #     c = slider_PA.value
+    # elif scan.scrollable_axis == 1:  # coronal
+    #     d = slider_PA.value
+    #     r = slider_IS.value
+    #     c = slider_RL.value
+    # else:  # axial
+    #     d = slider_IS.value
+    #     r = slider_PA.value
+    #     c = slider_RL.value
+
+    # # Calculate prism start coordinates (center - half prism shape)
+    # prism_start = np.array([
+    #     selected_plot_df["prism_start_z"],
+    #     selected_plot_df["prism_start_y"],
+    #     selected_plot_df["prism_start_x"]
+    # ])
+
+    # prism_shape = (
+    #     selected_plot_df["subset_center_z"],
+    #     selected_plot_df["subset_center_y"],
+    #     selected_plot_df["subset_center_x"]    
+    # )
+
+    # # Create visualization with the selected prism
+    # viz_scan = scan.create_rgb_scan_with_boxes(
+    #     scan_pixels_norm, 
+    #     [prism_start.astype(int)], 
+    #     PRISM_SHAPE, 
+    #     color=(200, 0, 0)
+    # )
+
+    # # Calculate prism start coordinates (center - half prism shape)
+    # prism_start = np.array([
+    #     comparison_prism["prism_start_z"],
+    #     comparison_prism["prism_start_y"],
+    #     comparison_prism["prism_start_x"]
+    # ])
+
+    # if scan.scrollable_axis == 0:  # sagittal
+    #     axes = [0, 2, 1, 3]
+    # elif scan.scrollable_axis == 1:  # coronal
+    #     axes = [1, 2, 0, 3]
+    # else:  # axial
+    #     axes = [2, 1, 0, 3]
+
+    # # Create visualization with the selected prism
+    # viz_scan = scan.create_rgb_scan_with_boxes(
+    #     viz_scan, 
+    #     [prism_start.astype(int)], 
+    #     PRISM_SHAPE, 
+    #     color=(0, 200, 0)
+    # )
+
+    # viz_scan = viz_scan.transpose(axes)
+
+    # viz_slider = mo.ui.slider(0, viz_scan.shape[0] - 1, value=selected_plot_df["prism_start_z"])
+    # viz_slider
+    return scan_pixels, selected_plot_df
 
 
 @app.cell
-def _(
-    comparison_prism,
-    mo,
-    prism_start,
-    selected_plot_df,
-    viz_scan,
-    viz_slider,
-):
-    mo.hstack([
-        mo.image(src=viz_scan[viz_slider.value]),
-        mo.image(src=viz_scan[prism_start[0]]),
+def _(selected_plot_df):
+    (
+        int(selected_plot_df["prism_start_z"]),
+        int(selected_plot_df["prism_start_y"]),
+        int(selected_plot_df["prism_start_x"])
+    )
+    return
+
+
+@app.cell
+def _(mo, np, scan_pixels):
+    mo.image(np.flipud(scan_pixels[114]), height=512)
+    return
+
+
+app._unparsable_cell(
+    r"""
+    wmo.hstack([
+        # mo.image(src=viz_scan[prism_start[0]]),
+        mo.image(np.flipud(scan_pixels[d]), height=512)
         mo.vstack([
-            comparison_prism["subset_center_z"] - selected_plot_df["subset_center_z"],
-            comparison_prism["subset_center_y"] - selected_plot_df["subset_center_y"],
-            comparison_prism["subset_center_x"] - selected_plot_df["subset_center_x"],
+            comparison_prism[\"subset_center_z\"] - selected_plot_df[\"subset_center_z\"],
+            comparison_prism[\"subset_center_y\"] - selected_plot_df[\"subset_center_y\"],
+            comparison_prism[\"subset_center_x\"] - selected_plot_df[\"subset_center_x\"],
         ])
     ])
-    return
+    """,
+    name="_"
+)
 
 
 @app.cell

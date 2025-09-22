@@ -251,7 +251,7 @@ class zarr_scan():
         n_patches: int,
         patch_jitter: float = 0.33,
         *, # Force subsequent arguments to be keyword-only for clarity
-        subset_start: Optional[Tuple[int, int, int]] = None,
+        subset_center: Optional[Tuple[int, int, int]] = None,
         subset_shape: Optional[Tuple[int, int, int]] = None,
         patch_indices: Optional[np.ndarray] = None,
         wc: Optional[float] = None,
@@ -269,8 +269,14 @@ class zarr_scan():
             n_patches = patch_indices.shape[0]
             # If indices are provided, we don't know the parent subset
         else:
-            if subset_start is None or subset_shape is None:
+            if subset_center is None:
                 subset_start, subset_shape = self.get_random_subset_from_scan(n_patches)
+            else:
+                subset_shape = 4 * self.orientation_normalized_patch_shape
+                subset_start = subset_center - (2*self.orientation_normalized_patch_shape)
+                subset_shape = subset_shape.astype(int)
+                subset_start = subset_start.astype(int)
+            print(subset_center, subset_start, subset_shape)
             results['subset_start'], results['subset_shape'] = subset_start, subset_shape
 
             patch_indices = self.get_stratified_random_patch_indices(
@@ -295,7 +301,7 @@ class zarr_scan():
         )
         normalized_patches = self.reshape_patches(normalized_patches)
         results['normalized_patches'] = normalized_patches
-        
+
 
         patch_centers_idx = (results['patch_indices'] + 0.5 * self.orientation_normalized_patch_shape).astype(int)
         results['patch_centers_idx'] = patch_centers_idx
@@ -543,7 +549,7 @@ class zarr_scan():
                 PA_rel : PA_rel + patch_PA,
                 IS_rel : IS_rel + patch_IS
             ]
-        
+
         return patches
 
     def reshape_patches(self, patches):
@@ -564,7 +570,7 @@ class zarr_scan():
         # Cast back to original dtype if needed, as resize may change it
         final_patches = final_patches.astype(patches.dtype)
         return final_patches
-    
+
     def convert_indices_to_patient_space(self, voxel_indices):
         affine_matrices = self.zarr_store['slice_affines'][:] # Load into memory
 

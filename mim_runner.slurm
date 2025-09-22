@@ -1,21 +1,22 @@
 #!/bin/bash
 # vim: ft=slurm
 
-#–––- JOB SPECIFICATIONS –––––
-#SBATCH --job-name=MIMsweep
-#SBATCH --output=mim_%j.log
-#SBATCH --partition=ai
-#SBATCH --time=12:00:00
+#–––- JOB SPECIFICATIONS (unchanged) –––––
+#SBATCH --job-name=MIM
+#SBATCH --output=job_%j.log
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=a100:1
-#SBATCH --cpus-per-gpu=48
-#SBATCH --mem-per-gpu=160G
+#SBATCH --gpus-per-node=p100:1
+#SBATCH --cpus-per-gpu=15
+#SBATCH --mem-per-gpu=30G
 
+#––––– ENVIRONMENT SETUP (now much faster) ––––––
 echo "========================================================"
 echo "Job is running on host: $(hostname)"
 echo "Job started at: $(date)"
 echo "---"
 
+# Load the same modules used to build the environment
 module purge
 module load arch_specific
 module load slurm/current
@@ -31,15 +32,12 @@ nvidia-smi
 echo "---"
 
 git branch
-echo "---"
-
 
 #––––– EXECUTION ––––––
-echo "Starting W&B sweep agent..."
+#echo "Starting training..."
 cd /cbica/home/gangarav/rsna25
-
-uv run wandb agent gangaramstyle-university-of-pennsylvania/kai/f8etzrex 
+uv run MIM_run.py 
 
 echo "========================================================"
-echo "Agent job finished at: $(date)"
+echo "Job finished at: $(date)"
 echo "========================================================"

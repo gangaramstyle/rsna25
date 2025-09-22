@@ -31,372 +31,378 @@ with app.setup:
     from sklearn.metrics import adjusted_rand_score
 
 
+@app.class_definition
+# define the LightningModule
+class RadiographyEncoder(L.LightningModule):
+
+    class MIMHead(nn.Module):
+        def __init__(self, dim, pos_max_freq, patch_size, depth, layer_dropout):
+            super().__init__()
+            self.pos_emb = PosEmbedding3D(dim, max_freq = pos_max_freq)
+            self.mim = CrossAttender(dim = dim, depth = depth, layer_dropout=layer_dropout)
+            self.to_pixels = nn.Linear(dim, np.prod(patch_size))
+            self.patch_size = patch_size
+
+        def forward(self, coords, context):
+            sin, cos = self.pos_emb(coords)
+            sin_unrepeated = sin[:, :, 0::2]
+            cos_unrepeated = cos[:, :, 0::2]
+            pos = PosEmbedding3D.interleave_two_tensors(sin_unrepeated, cos_unrepeated)
+
+            unmasked = self.mim(pos, context=context)
+            unmasked = self.to_pixels(unmasked)
+            unmasked = unmasked.view(unmasked.size(0), unmasked.size(1), *self.patch_size)
+            return unmasked
+
+    @staticmethod
+    def supervised_contrastive_loss(embeddings, labels, temperature=0.1):
+        """
+        Computes the Supervised Contrastive Loss for a batch of embeddings.
+
+        Args:
+            embeddings (torch.Tensor): A tensor of shape [N, D] where N is the batch size
+                                       and D is the embedding dimension. Embeddings should be
+                                       L2 normalized.
+            labels (torch.Tensor): A tensor of shape [N] with the sample ID for each embedding.
+            temperature (float): The temperature scaling factor.
+
+        Returns:
+            torch.Tensor: The calculated loss.
+        """
+        device = embeddings.device
+        n = embeddings.shape[0]
+
+        # 1. Calculate all-pairs similarity
+        # The result is a matrix of shape [N, N]
+        similarity_matrix = embeddings @ embeddings.t()
+
+        # 2. Create the positive-pair mask
+        # The mask will be True where labels are the same, False otherwise.
+        # labels.unsqueeze(0) creates a row vector [1, N]
+        # labels.unsqueeze(1) creates a column vector [N, 1]
+        # Broadcasting them results in a [N, N] matrix of pairwise label comparisons.
+        labels_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
+
+        # 3. Discard self-similarity from positives
+        # We create a mask to remove the diagonal (where an embedding is compared to itself)
+        # an embedding cannot be its own positive pair.
+        identity_mask = torch.eye(n, device=device).bool()
+        positives_mask = labels_matrix & ~identity_mask
+
+        # 4. Create mask for negative pairs
+        # Negatives are all pairs that are not self and not positive.
+        negatives_mask = ~labels_matrix
+
+        # The original NT-Xent loss can be simplified for this multi-positive case.
+        # For each anchor, the loss is -log( sum(exp(sim_pos)) / sum(exp(sim_all_others)) )
+
+        # To prevent log(0) issues for anchors with no positive pairs, we can mask them out.
+        # However, the formulation below handles this gracefully.
+
+        # We need a mask to exclude the diagonal from the denominator's log-sum-exp
+        logits_mask = ~identity_mask
+
+        # Apply temperature scaling
+        similarity_matrix /= temperature
+
+        # For each row (anchor), we compute the log-softmax over all other samples.
+        # The similarity_matrix[logits_mask] flattens the matrix, removing the diagonal.
+        # .reshape(n, n - 1) makes it a [N, N-1] matrix where each row corresponds
+        # to the similarities of one anchor to all N-1 other samples.
+        log_probs = nn.functional.log_softmax(similarity_matrix[logits_mask].reshape(n, n - 1), dim=1)
+
+        # The positives_mask now needs to align with the log_probs matrix.
+        # We remove the diagonal from positives_mask as well.
+        positives_mask_for_loss = positives_mask[logits_mask].reshape(n, n - 1)
+
+        # For each anchor, we want to sum the log-probabilities of its positive pairs.
+        # We use the positive mask to select these probabilities.
+        # We normalize by the number of positive pairs for each anchor to get the mean.
+        # Adding a small epsilon (1e-7) to the denominator prevents division by zero
+        # in case an anchor has no positive pairs (it's the only one of its class).
+        num_positives_per_row = positives_mask_for_loss.sum(dim=1)
+        loss = - (positives_mask_for_loss * log_probs).sum(dim=1) / (num_positives_per_row + 1e-7)
+
+        # We average the loss over all anchors that had at least one positive pair.
+        # This prevents anchors with no positives from contributing a 0 to the mean.
+        loss = loss[num_positives_per_row > 0].mean()
+
+        return loss
+
+    def __init__(
+        self,
+        *,
+        # model hyperparameters
+        encoder_dim,
+        encoder_depth,
+        encoder_heads,
+        mlp_dim,
+        n_registers,
+        # position embedding
+        pos_max_freq,
+        use_rotary,
+        use_absolute,
+        # training runtime hyperparameters
+        batch_size,
+        learning_rate,
+        # dataset hyperparameters
+        patch_size,
+        patch_jitter,
+        # objectives
+        pos_objective_mode,
+        window_objective,
+        scan_contrastive_objective,
+        mim_objective,
+
+    ):
+        # view objectives refer to:
+        #  x, y, z axes
+        #  (window width, window center)
+        #  (zoom scale, rotation x, y, z)
+        self.NUM_POS_OBJECTIVES = 3
+        self.NUM_WINDOW_OBJECTIVES = 2
+        self.n_registers = n_registers
+
+        super().__init__()
+
+        self.save_hyperparameters()
+        self.encoder = RvT(
+            patch_size=patch_size,
+            register_count=n_registers,
+            dim=encoder_dim,
+            depth=encoder_depth,
+            heads=encoder_heads,
+            mlp_dim=mlp_dim,
+            use_rotary=use_rotary,
+            pos_max_freq=pos_max_freq,
+            use_absolute=use_absolute,
+        )
+
+        # CAUTION: relative view head requires two concatenated
+        # encoder outputs because it calculates the relative
+        # difference* between the objectives
+        self.relative_pos_head = nn.Sequential(
+            nn.LayerNorm(encoder_dim * 2), nn.Linear(encoder_dim * 2, self.NUM_POS_OBJECTIVES)
+        )
+
+        self.relative_window_head = nn.Sequential(
+            nn.LayerNorm(encoder_dim * 2), nn.Linear(encoder_dim * 2, self.NUM_WINDOW_OBJECTIVES)
+        )
+
+        if self.hparams.pos_objective_mode == "classification":
+            self.pos_view_criterion = nn.BCEWithLogitsLoss()
+        elif self.hparams.pos_objective_mode == "regression":
+            self.pos_view_criterion = nn.MSELoss()
+
+        self.window_view_criterion = nn.BCEWithLogitsLoss()
+
+        self.mim = RadiographyEncoder.MIMHead(encoder_dim, pos_max_freq, patch_size, depth=4, layer_dropout=0.2)
+        self.mim_loss = nn.SmoothL1Loss()
+
+        self.validation_step_outputs = []
+
+    def raw_encoder_emb_to_scan_view_registers_patches(self, emb):
+        # 0: global scan embedding
+        # 1: local view embedding
+        # 2 - 2+registers: register tokens
+        # 2+registers - end: patch embeddings
+        return (
+            emb[:, 0:1],
+            emb[:, 1:2],
+            emb[:, 2 : 2 + self.n_registers],
+            emb[:, 2 + self.n_registers :],
+        )
+
+    def training_step(self, batch, batch_idx):
+        patches_1, patches_2, patch_coords_1, patch_coords_2, aux_patches_1, aux_patches_2, aux_coords_1, aux_coords_2, label, row_id = batch
+
+        # Split patches and indices for input vs label
+        split_size = 50
+
+        input_patches_1 = patches_1[:,:split_size]
+        mim_patches_1 = patches_1[:,split_size:]
+        input_coords_1 = patch_coords_1[:,:split_size]
+        mim_coords_1 = patch_coords_1[:,split_size:]
+
+        input_patches_2 = patches_2[:,:split_size]
+        mim_patches_2 = patches_2[:,split_size:]
+        input_coords_2 = patch_coords_2[:,:split_size]
+        mim_coords_2 = patch_coords_2[:,split_size:]
+
+        all_patches_1 = torch.cat([input_patches_1, aux_patches_1], dim=1)
+        all_coords_1 = torch.cat([input_coords_1, aux_coords_1], dim=1)
+        emb1 = self.encoder(all_patches_1, all_coords_1)
+
+        all_patches_2 = torch.cat([input_patches_2, aux_patches_2], dim=1)
+        all_coords_2 = torch.cat([input_coords_2, aux_coords_2], dim=1)
+        emb2 = self.encoder(all_patches_2, all_coords_2)
+
+        scan_cls_1, view_cls_1, registers_1, patch_emb_1 = (
+            self.raw_encoder_emb_to_scan_view_registers_patches(emb1)
+        )
+        scan_cls_2, view_cls_2, registers_2, patch_emb_2 = (
+            self.raw_encoder_emb_to_scan_view_registers_patches(emb2)
+        )
+
+        fused_view_cls = torch.cat((view_cls_1.squeeze(), view_cls_2.squeeze()), dim=1)
+
+        fused_scan_cls = torch.cat((scan_cls_1.squeeze(), scan_cls_2.squeeze()), dim = 0)
+        fused_scan_cls = nn.functional.normalize(fused_scan_cls, p=2, dim=1)
+        fused_scan_ids = torch.cat((row_id, row_id), dim = 0)
+
+        # --- DYNAMIC LOSS CALCULATION ---
+        total_loss = 0.0
+
+        pos_label = label[:, :self.NUM_POS_OBJECTIVES]
+        if self.hparams.pos_objective_mode == "classification":
+            pos_target = (pos_label > 0).to(torch.float32)
+        elif self.hparams.pos_objective_mode == "regression":
+            # Target is the actual distance value
+            pos_target = (pos_label / 100).to(torch.float32)
+
+        pos_prediction = self.relative_pos_head(fused_view_cls)
+        pos_loss = self.pos_view_criterion(pos_prediction, pos_target)
+
+        total_loss += pos_loss
+        self.log("pos_loss", pos_loss)
+
+        if self.hparams.window_objective:
+            window_label = label[:, -self.NUM_WINDOW_OBJECTIVES:]
+            window_target = (window_label > 0).to(torch.float32)
+
+            window_prediction = self.relative_window_head(fused_view_cls)
+            window_loss = self.window_view_criterion(window_prediction, window_target)
+
+            total_loss += window_loss
+            self.log("window_loss", window_loss)
+
+        if self.hparams.scan_contrastive_objective:
+            scan_loss = self.supervised_contrastive_loss(fused_scan_cls, fused_scan_ids)/4.0
+            total_loss += scan_loss
+            self.log("scan_loss", scan_loss)
+
+        if self.hparams.mim_objective:
+            mim_prediction_1 = self.mim(
+                mim_coords_1,
+                torch.cat((scan_cls_1, view_cls_1, patch_emb_1), dim=1)
+            )
+            mim_prediction_2 = self.mim(
+                mim_coords_2,
+                torch.cat((scan_cls_2, view_cls_2, patch_emb_2), dim=1)
+            )
+
+            mim_1_loss = self.mim_loss(mim_prediction_1, mim_patches_1)
+            mim_2_loss = self.mim_loss(mim_prediction_2, mim_patches_2)
+
+            self.log("mim_loss", mim_1_loss + mim_2_loss)
+            total_loss += mim_1_loss + mim_2_loss
+
+        self.log("loss", total_loss)
+
+        return total_loss
+
+    # def validation_step(self, batch, batch_idx):
+    #     # The validation dataloader yields (patches, centers, location)
+    #     patches, centers, locations = batch
+
+    #     # Get the view embedding
+    #     emb = self.encoder(patches, centers)
+    #     view_embedding = emb[:, 1]
+
+    #     # Store the outputs for later use in `on_validation_epoch_end`
+    #     # .detach().cpu() is important to avoid GPU memory leaks
+    #     output = {"embeddings": view_embedding.detach().cpu(), "locations": locations}
+    #     self.validation_step_outputs.append(output)
+    #     return output
+
+    # # --- NEW: ON_VALIDATION_EPOCH_END ---
+    # def on_validation_epoch_end(self):
+    #     if not self.validation_step_outputs:
+    #         print("No validation outputs to process.")
+    #         return
+
+    #     # --- 1. Aggregate all embeddings and locations from batches ---
+    #     all_embeddings = torch.cat([x["embeddings"] for x in self.validation_step_outputs]).numpy()
+
+    #     # Locations might be a list of tuples, so we flatten it
+    #     all_locations = []
+    #     for x in self.validation_step_outputs:
+    #         all_locations.extend(x["locations"])
+
+    #     # --- 2. Perform Clustering and ARI Calculation (your logic) ---
+    #     target_locations = ["Left Middle Cerebral Artery", "Right Middle Cerebral Artery"]
+    #     filtered_indices = [i for i, loc in enumerate(all_locations) if loc in target_locations]
+
+    #     if not filtered_indices:
+    #         print("No validation data found for target locations. Skipping ARI calculation.")
+    #         self.validation_step_outputs.clear()  # IMPORTANT: Clear stored outputs
+    #         return
+
+    #     filtered_embeddings = all_embeddings[filtered_indices]
+    #     filtered_locations = [all_locations[i] for i in filtered_indices]
+
+    #     # --- 3. Create and Log Visualization to wandb ---
+    #     pca = PCA(n_components=3)
+    #     embeddings_3d = pca.fit_transform(filtered_embeddings)
+
+    #     n_clusters = len(target_locations)
+    #     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    #     cluster_labels = kmeans.fit_predict(embeddings_3d)
+
+    #     ari_score = adjusted_rand_score(filtered_locations, cluster_labels)
+
+    #     # Log the ARI score to wandb
+    #     self.log("val_ari_score", ari_score, prog_bar=True)
+    #     print(f"Validation ARI Score: {ari_score:.4f}")
+
+    #     fig = plt.figure(figsize=(20, 9))
+    #     fig.suptitle(
+    #         f"Clustering (Step {self.global_step}) - Ground Truth vs. K-Means", fontsize=16
+    #     )
+
+    #     # Plot 1: Ground Truth
+    #     ax1 = fig.add_subplot(121, projection="3d")
+    #     unique_locs = list(set(filtered_locations))
+    #     color_map = {loc: plt.cm.viridis(i / len(unique_locs)) for i, loc in enumerate(unique_locs)}
+    #     gt_colors = [color_map[loc] for loc in filtered_locations]
+    #     ax1.scatter(
+    #         embeddings_3d[:, 0], embeddings_3d[:, 1], embeddings_3d[:, 2], c=gt_colors, alpha=0.7
+    #     )
+    #     ax1.set_title("Ground Truth Labels")
+
+    #     # Plot 2: K-Means Predictions
+    #     ax2 = fig.add_subplot(122, projection="3d")
+    #     ax2.scatter(
+    #         embeddings_3d[:, 0],
+    #         embeddings_3d[:, 1],
+    #         embeddings_3d[:, 2],
+    #         c=cluster_labels,
+    #         cmap="viridis",
+    #         alpha=0.7,
+    #     )
+    #     ax2.set_title(f"K-Means Clusters (ARI: {ari_score:.2f})")
+
+    #     # Log the figure to Weights & Biases
+    #     self.logger.experiment.log({"validation_clusters": wandb.Image(fig)})
+    #     plt.close(fig)  # Close the figure to free memory
+
+    #     # --- 4. IMPORTANT: Clear the stored outputs ---
+    #     self.validation_step_outputs.clear()
+
+    def configure_optimizers(self):
+        # Use the learning_rate from hparams so it can be configured by sweeps
+        optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+        return optimizer
+
+
 @app.cell
 def _():
-    # define the LightningModule
-    class RadiographyEncoder(L.LightningModule):
-        def __init__(
-            self,
-            *,
-            # model hyperparameters
-            encoder_dim,
-            encoder_depth,
-            encoder_heads,
-            mlp_dim,
-            n_registers,
-            # position embedding
-            pos_max_freq,
-            use_rotary,
-            use_absolute,
-            # training runtime hyperparameters
-            batch_size,
-            learning_rate,
-            # dataset hyperparameters
-            patch_size,
-            patch_jitter,
-            # objectives
-            pos_objective_mode,
-            window_objective,
-            scan_contrastive_objective,
-            mim_objective,
+    return
 
-        ):
-            # view objectives refer to:
-            #  x, y, z axes
-            #  (window width, window center)
-            #  (zoom scale, rotation x, y, z)
-            self.NUM_POS_OBJECTIVES = 3
-            self.NUM_WINDOW_OBJECTIVES = 2
-            self.n_registers = n_registers
 
-            super().__init__()
-
-            self.save_hyperparameters()
-            self.encoder = RvT(
-                patch_size=patch_size,
-                register_count=n_registers,
-                dim=encoder_dim,
-                depth=encoder_depth,
-                heads=encoder_heads,
-                mlp_dim=mlp_dim,
-                use_rotary=use_rotary,
-                pos_max_freq=pos_max_freq,
-                use_absolute=use_absolute,
-            )
-
-            # CAUTION: relative view head requires two concatenated
-            # encoder outputs because it calculates the relative
-            # difference* between the objectives
-            self.relative_pos_head = nn.Sequential(
-                nn.LayerNorm(encoder_dim * 2), nn.Linear(encoder_dim * 2, self.NUM_POS_OBJECTIVES)
-            )
-
-            self.relative_window_head = nn.Sequential(
-                nn.LayerNorm(encoder_dim * 2), nn.Linear(encoder_dim * 2, self.NUM_WINDOW_OBJECTIVES)
-            )
-
-            if self.hparams.pos_objective_mode == "classification":
-                self.pos_view_criterion = nn.BCEWithLogitsLoss()
-            elif self.hparams.pos_objective_mode == "regression":
-                self.pos_view_criterion = nn.MSELoss()
-
-            self.window_view_criterion = nn.BCEWithLogitsLoss()
-
-            self.mim = MIMHead(encoder_dim, pos_max_freq, patch_size, depth=4, layer_dropout=0.2)
-            self.mim_loss = nn.SmoothL1Loss()
-
-            self.validation_step_outputs = []
-
-        def raw_encoder_emb_to_scan_view_registers_patches(self, emb):
-            # 0: global scan embedding
-            # 1: local view embedding
-            # 2 - 2+registers: register tokens
-            # 2+registers - end: patch embeddings
-            return (
-                emb[:, 0:1],
-                emb[:, 1:2],
-                emb[:, 2 : 2 + self.n_registers],
-                emb[:, 2 + self.n_registers :],
-            )
-
-        def training_step(self, batch, batch_idx):
-            patches_1, patches_2, patch_coords_1, patch_coords_2, aux_patches_1, aux_patches_2, aux_coords_1, aux_coords_2, label, row_id = batch
-
-            # Split patches and indices for input vs label
-            split_size = 50
-
-            input_patches_1 = patches_1[:,:split_size]
-            mim_patches_1 = patches_1[:,split_size:]
-            input_coords_1 = patch_coords_1[:,:split_size]
-            mim_coords_1 = patch_coords_1[:,split_size:]
-
-            input_patches_2 = patches_2[:,:split_size]
-            mim_patches_2 = patches_2[:,split_size:]
-            input_coords_2 = patch_coords_2[:,:split_size]
-            mim_coords_2 = patch_coords_2[:,split_size:]
-
-            all_patches_1 = torch.cat([input_patches_1, aux_patches_1], dim=1)
-            all_coords_1 = torch.cat([input_coords_1, aux_coords_1], dim=1)
-            emb1 = self.encoder(all_patches_1, all_coords_1)
-
-            all_patches_2 = torch.cat([input_patches_2, aux_patches_2], dim=1)
-            all_coords_2 = torch.cat([input_coords_2, aux_coords_2], dim=1)
-            emb2 = self.encoder(all_patches_2, all_coords_2)
-
-            scan_cls_1, view_cls_1, registers_1, patch_emb_1 = (
-                self.raw_encoder_emb_to_scan_view_registers_patches(emb1)
-            )
-            scan_cls_2, view_cls_2, registers_2, patch_emb_2 = (
-                self.raw_encoder_emb_to_scan_view_registers_patches(emb2)
-            )
-
-            fused_view_cls = torch.cat((view_cls_1.squeeze(), view_cls_2.squeeze()), dim=1)
-
-            fused_scan_cls = torch.cat((scan_cls_1.squeeze(), scan_cls_2.squeeze()), dim = 0)
-            fused_scan_cls = nn.functional.normalize(fused_scan_cls, p=2, dim=1)
-            fused_scan_ids = torch.cat((row_id, row_id), dim = 0)
-
-            # --- DYNAMIC LOSS CALCULATION ---
-            total_loss = 0.0
-
-            pos_label = label[:, :self.NUM_POS_OBJECTIVES]
-            if self.hparams.pos_objective_mode == "classification":
-                pos_target = (pos_label > 0).to(torch.float32)
-            elif self.hparams.pos_objective_mode == "regression":
-                # Target is the actual distance value
-                pos_target = (pos_label / 100).to(torch.float32)
-
-            pos_prediction = self.relative_pos_head(fused_view_cls)
-            pos_loss = self.pos_view_criterion(pos_prediction, pos_target)
-
-            total_loss += pos_loss
-            self.log("pos_loss", pos_loss)
-
-            if self.hparams.window_objective:
-                window_label = label[:, -self.NUM_WINDOW_OBJECTIVES:]
-                window_target = (window_label > 0).to(torch.float32)
-
-                window_prediction = self.relative_window_head(fused_view_cls)
-                window_loss = self.window_view_criterion(window_prediction, window_target)
-
-                total_loss += window_loss
-                self.log("window_loss", window_loss)
-
-            if self.hparams.scan_contrastive_objective:
-                scan_loss = supervised_contrastive_loss(fused_scan_cls, fused_scan_ids)/4.0
-                total_loss += scan_loss
-                self.log("scan_loss", scan_loss)
-
-            if self.hparams.mim_objective:
-                mim_prediction_1 = self.mim(
-                    mim_coords_1,
-                    torch.cat((scan_cls_1, view_cls_1, patch_emb_1), dim=1)
-                )
-                mim_prediction_2 = self.mim(
-                    mim_coords_2,
-                    torch.cat((scan_cls_2, view_cls_2, patch_emb_2), dim=1)
-                )
-
-                mim_1_loss = self.mim_loss(mim_prediction_1, mim_patches_1)
-                mim_2_loss = self.mim_loss(mim_prediction_2, mim_patches_2)
-
-                self.log("mim_loss", mim_1_loss + mim_2_loss)
-                total_loss += mim_1_loss + mim_2_loss
-
-            self.log("loss", total_loss)
-
-            return total_loss
-
-        # def validation_step(self, batch, batch_idx):
-        #     # The validation dataloader yields (patches, centers, location)
-        #     patches, centers, locations = batch
-
-        #     # Get the view embedding
-        #     emb = self.encoder(patches, centers)
-        #     view_embedding = emb[:, 1]
-
-        #     # Store the outputs for later use in `on_validation_epoch_end`
-        #     # .detach().cpu() is important to avoid GPU memory leaks
-        #     output = {"embeddings": view_embedding.detach().cpu(), "locations": locations}
-        #     self.validation_step_outputs.append(output)
-        #     return output
-
-        # # --- NEW: ON_VALIDATION_EPOCH_END ---
-        # def on_validation_epoch_end(self):
-        #     if not self.validation_step_outputs:
-        #         print("No validation outputs to process.")
-        #         return
-
-        #     # --- 1. Aggregate all embeddings and locations from batches ---
-        #     all_embeddings = torch.cat([x["embeddings"] for x in self.validation_step_outputs]).numpy()
-
-        #     # Locations might be a list of tuples, so we flatten it
-        #     all_locations = []
-        #     for x in self.validation_step_outputs:
-        #         all_locations.extend(x["locations"])
-
-        #     # --- 2. Perform Clustering and ARI Calculation (your logic) ---
-        #     target_locations = ["Left Middle Cerebral Artery", "Right Middle Cerebral Artery"]
-        #     filtered_indices = [i for i, loc in enumerate(all_locations) if loc in target_locations]
-
-        #     if not filtered_indices:
-        #         print("No validation data found for target locations. Skipping ARI calculation.")
-        #         self.validation_step_outputs.clear()  # IMPORTANT: Clear stored outputs
-        #         return
-
-        #     filtered_embeddings = all_embeddings[filtered_indices]
-        #     filtered_locations = [all_locations[i] for i in filtered_indices]
-
-        #     # --- 3. Create and Log Visualization to wandb ---
-        #     pca = PCA(n_components=3)
-        #     embeddings_3d = pca.fit_transform(filtered_embeddings)
-
-        #     n_clusters = len(target_locations)
-        #     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        #     cluster_labels = kmeans.fit_predict(embeddings_3d)
-
-        #     ari_score = adjusted_rand_score(filtered_locations, cluster_labels)
-
-        #     # Log the ARI score to wandb
-        #     self.log("val_ari_score", ari_score, prog_bar=True)
-        #     print(f"Validation ARI Score: {ari_score:.4f}")
-
-        #     fig = plt.figure(figsize=(20, 9))
-        #     fig.suptitle(
-        #         f"Clustering (Step {self.global_step}) - Ground Truth vs. K-Means", fontsize=16
-        #     )
-
-        #     # Plot 1: Ground Truth
-        #     ax1 = fig.add_subplot(121, projection="3d")
-        #     unique_locs = list(set(filtered_locations))
-        #     color_map = {loc: plt.cm.viridis(i / len(unique_locs)) for i, loc in enumerate(unique_locs)}
-        #     gt_colors = [color_map[loc] for loc in filtered_locations]
-        #     ax1.scatter(
-        #         embeddings_3d[:, 0], embeddings_3d[:, 1], embeddings_3d[:, 2], c=gt_colors, alpha=0.7
-        #     )
-        #     ax1.set_title("Ground Truth Labels")
-
-        #     # Plot 2: K-Means Predictions
-        #     ax2 = fig.add_subplot(122, projection="3d")
-        #     ax2.scatter(
-        #         embeddings_3d[:, 0],
-        #         embeddings_3d[:, 1],
-        #         embeddings_3d[:, 2],
-        #         c=cluster_labels,
-        #         cmap="viridis",
-        #         alpha=0.7,
-        #     )
-        #     ax2.set_title(f"K-Means Clusters (ARI: {ari_score:.2f})")
-
-        #     # Log the figure to Weights & Biases
-        #     self.logger.experiment.log({"validation_clusters": wandb.Image(fig)})
-        #     plt.close(fig)  # Close the figure to free memory
-
-        #     # --- 4. IMPORTANT: Clear the stored outputs ---
-        #     self.validation_step_outputs.clear()
-
-        def configure_optimizers(self):
-            # Use the learning_rate from hparams so it can be configured by sweeps
-            optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-            return optimizer
-    return (RadiographyEncoder,)
-
-
-@app.class_definition
-class MIMHead(nn.Module):
-    def __init__(self, dim, pos_max_freq, patch_size, depth, layer_dropout):
-        super().__init__()
-        self.pos_emb = PosEmbedding3D(dim, max_freq = pos_max_freq)
-        self.mim = CrossAttender(dim = dim, depth = depth, layer_dropout=layer_dropout)
-        self.to_pixels = nn.Linear(dim, np.prod(patch_size))
-        self.patch_size = patch_size
-
-    def forward(self, coords, context):
-        sin, cos = self.pos_emb(coords)
-        sin_unrepeated = sin[:, :, 0::2]
-        cos_unrepeated = cos[:, :, 0::2]
-        pos = PosEmbedding3D.interleave_two_tensors(sin_unrepeated, cos_unrepeated)
-
-        unmasked = self.mim(pos, context=context)
-        unmasked = self.to_pixels(unmasked)
-        unmasked = unmasked.view(unmasked.size(0), unmasked.size(1), *self.patch_size)
-        return unmasked
-
-
-@app.function
-def supervised_contrastive_loss(embeddings, labels, temperature=0.1):
-    """
-    Computes the Supervised Contrastive Loss for a batch of embeddings.
-
-    Args:
-        embeddings (torch.Tensor): A tensor of shape [N, D] where N is the batch size
-                                   and D is the embedding dimension. Embeddings should be
-                                   L2 normalized.
-        labels (torch.Tensor): A tensor of shape [N] with the sample ID for each embedding.
-        temperature (float): The temperature scaling factor.
-
-    Returns:
-        torch.Tensor: The calculated loss.
-    """
-    device = embeddings.device
-    n = embeddings.shape[0]
-
-    # 1. Calculate all-pairs similarity
-    # The result is a matrix of shape [N, N]
-    similarity_matrix = embeddings @ embeddings.t()
-
-    # 2. Create the positive-pair mask
-    # The mask will be True where labels are the same, False otherwise.
-    # labels.unsqueeze(0) creates a row vector [1, N]
-    # labels.unsqueeze(1) creates a column vector [N, 1]
-    # Broadcasting them results in a [N, N] matrix of pairwise label comparisons.
-    labels_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
-
-    # 3. Discard self-similarity from positives
-    # We create a mask to remove the diagonal (where an embedding is compared to itself)
-    # an embedding cannot be its own positive pair.
-    identity_mask = torch.eye(n, device=device).bool()
-    positives_mask = labels_matrix & ~identity_mask
-
-    # 4. Create mask for negative pairs
-    # Negatives are all pairs that are not self and not positive.
-    negatives_mask = ~labels_matrix
-
-    # The original NT-Xent loss can be simplified for this multi-positive case.
-    # For each anchor, the loss is -log( sum(exp(sim_pos)) / sum(exp(sim_all_others)) )
-
-    # To prevent log(0) issues for anchors with no positive pairs, we can mask them out.
-    # However, the formulation below handles this gracefully.
-
-    # We need a mask to exclude the diagonal from the denominator's log-sum-exp
-    logits_mask = ~identity_mask
-
-    # Apply temperature scaling
-    similarity_matrix /= temperature
-
-    # For each row (anchor), we compute the log-softmax over all other samples.
-    # The similarity_matrix[logits_mask] flattens the matrix, removing the diagonal.
-    # .reshape(n, n - 1) makes it a [N, N-1] matrix where each row corresponds
-    # to the similarities of one anchor to all N-1 other samples.
-    log_probs = nn.functional.log_softmax(similarity_matrix[logits_mask].reshape(n, n - 1), dim=1)
-
-    # The positives_mask now needs to align with the log_probs matrix.
-    # We remove the diagonal from positives_mask as well.
-    positives_mask_for_loss = positives_mask[logits_mask].reshape(n, n - 1)
-
-    # For each anchor, we want to sum the log-probabilities of its positive pairs.
-    # We use the positive mask to select these probabilities.
-    # We normalize by the number of positive pairs for each anchor to get the mean.
-    # Adding a small epsilon (1e-7) to the denominator prevents division by zero
-    # in case an anchor has no positive pairs (it's the only one of its class).
-    num_positives_per_row = positives_mask_for_loss.sum(dim=1)
-    loss = - (positives_mask_for_loss * log_probs).sum(dim=1) / (num_positives_per_row + 1e-7)
-
-    # We average the loss over all anchors that had at least one positive pair.
-    # This prevents anchors with no positives from contributing a 0 to the mean.
-    loss = loss[num_positives_per_row > 0].mean()
-
-    return loss
+@app.cell
+def _():
+    return
 
 
 @app.class_definition
@@ -714,7 +720,7 @@ class ValidationDataset(IterableDataset):
 
 
 @app.cell
-def _(RadiographyEncoder):
+def _():
     def get_allocated_cpus():
         """
         Gets the number of CPUs allocated to the job.
@@ -791,9 +797,9 @@ def _(RadiographyEncoder):
         )
 
         # --- 4. Setup Data ---
-        PATCH_SHAPE = (1, 16, 16)
+        PATCH_SHAPE = (1, 8, 8)
         N_PATCHES = 64
-        NUM_WORKERS = int(get_allocated_cpus()*0.8)
+        NUM_WORKERS = int(get_allocated_cpus())-2
         METADATA_PATH = '/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet'
         scratch_dir = os.environ.get('TMP') + "/scans"
 
@@ -815,8 +821,8 @@ def _(RadiographyEncoder):
         )
         dataloader = DataLoader(
             dataset,
-            batch_size=int(cfg.batch_size * (get_gpu_memory_gb()[0]/80.0)),
-            num_workers=int(NUM_WORKERS * 0.8),
+            batch_size=int(cfg.batch_size * (get_gpu_memory_gb()[0]/100.0)),
+            num_workers=int(NUM_WORKERS),
             persistent_workers=(NUM_WORKERS > 0),
             pin_memory=True,
         )
