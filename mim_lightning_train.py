@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.14.16"
+__generated_with = "0.16.1"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -29,6 +29,17 @@ with app.setup:
     import matplotlib.pyplot as plt
     from sklearn.cluster import KMeans
     from sklearn.metrics import adjusted_rand_score
+    import tempfile
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import train_test_split
+    from sklearn.svm import SVC
+    import matplotlib
+    matplotlib.use('Agg') # <-- This is correct, keep it.
+
+    from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+    import matplotlib.pyplot as plt
+    import imageio
+    import io
 
 
 @app.class_definition
@@ -301,93 +312,98 @@ class RadiographyEncoder(L.LightningModule):
 
         return total_loss
 
-    # def validation_step(self, batch, batch_idx):
-    #     # The validation dataloader yields (patches, centers, location)
-    #     patches, centers, locations = batch
+    def validation_step(self, batch, batch_idx):
+        # The validation dataloader yields (patches, centers, location)
+        patches, patch_coords, locations, _, _ = batch
 
-    #     # Get the view embedding
-    #     emb = self.encoder(patches, centers)
-    #     view_embedding = emb[:, 1]
+        # Get the view embedding
+        emb = self.encoder(patches, patch_coords)
+        view_embedding = emb[:, 1]
 
-    #     # Store the outputs for later use in `on_validation_epoch_end`
-    #     # .detach().cpu() is important to avoid GPU memory leaks
-    #     output = {"embeddings": view_embedding.detach().cpu(), "locations": locations}
-    #     self.validation_step_outputs.append(output)
-    #     return output
+        # Store the outputs for later use in `on_validation_epoch_end`
+        # .detach().cpu() is important to avoid GPU memory leaks
+        output = {"embeddings": view_embedding.detach().cpu(), "locations": locations}
+        self.validation_step_outputs.append(output)
+        return output
 
-    # # --- NEW: ON_VALIDATION_EPOCH_END ---
-    # def on_validation_epoch_end(self):
-    #     if not self.validation_step_outputs:
-    #         print("No validation outputs to process.")
-    #         return
+    def on_validation_epoch_end(self):
+        if not self.validation_step_outputs:
+            print("No validation outputs to process.")
+            return
 
-    #     # --- 1. Aggregate all embeddings and locations from batches ---
-    #     all_embeddings = torch.cat([x["embeddings"] for x in self.validation_step_outputs]).numpy()
+        # --- 1. Aggregate all embeddings and locations from batches ---
+        all_embeddings = torch.cat([x["embeddings"] for x in self.validation_step_outputs]).numpy()
 
-    #     # Locations might be a list of tuples, so we flatten it
-    #     all_locations = []
-    #     for x in self.validation_step_outputs:
-    #         all_locations.extend(x["locations"])
+        # Locations might be a list of tuples, so we flatten it
+        all_locations = []
+        for x in self.validation_step_outputs:
+            all_locations.extend(x["locations"])
 
-    #     # --- 2. Perform Clustering and ARI Calculation (your logic) ---
-    #     target_locations = ["Left Middle Cerebral Artery", "Right Middle Cerebral Artery"]
-    #     filtered_indices = [i for i, loc in enumerate(all_locations) if loc in target_locations]
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(all_embeddings)
 
-    #     if not filtered_indices:
-    #         print("No validation data found for target locations. Skipping ARI calculation.")
-    #         self.validation_step_outputs.clear()  # IMPORTANT: Clear stored outputs
-    #         return
+        images = []
+        accuracies = []
+        test_sizes = np.arange(0.1, 1.0, 0.1)
 
-    #     filtered_embeddings = all_embeddings[filtered_indices]
-    #     filtered_locations = [all_locations[i] for i in filtered_indices]
+        # Iterate through different test sizes
+        for test_size in test_sizes:
+            # Create a fresh figure and axes for each plot
+            fig, ax = plt.subplots(figsize=(10, 8))
 
-    #     # --- 3. Create and Log Visualization to wandb ---
-    #     pca = PCA(n_components=3)
-    #     embeddings_3d = pca.fit_transform(filtered_embeddings)
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_scaled, all_locations, test_size=test_size, random_state=42, stratify=all_locations
+            )
 
-    #     n_clusters = len(target_locations)
-    #     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    #     cluster_labels = kmeans.fit_predict(embeddings_3d)
+            # Train SVM classifier
+            svm = SVC(kernel='linear', C=0.001, class_weight='balanced')
+            svm.fit(X_train, y_train)
 
-    #     ari_score = adjusted_rand_score(filtered_locations, cluster_labels)
+            y_pred = svm.predict(X_test)
+            accuracy = (y_pred == y_test).mean()
+            accuracies.append(accuracy)
 
-    #     # Log the ARI score to wandb
-    #     self.log("val_ari_score", ari_score, prog_bar=True)
-    #     print(f"Validation ARI Score: {ari_score:.4f}")
+            # A convenience method to plot directly from predictions
 
-    #     fig = plt.figure(figsize=(20, 9))
-    #     fig.suptitle(
-    #         f"Clustering (Step {self.global_step}) - Ground Truth vs. K-Means", fontsize=16
-    #     )
+            ConfusionMatrixDisplay.from_predictions(y_test, y_pred, ax=ax, normalize='true')
+            ax.set_title(f'Test Size: {test_size:.1f}')
 
-    #     # Plot 1: Ground Truth
-    #     ax1 = fig.add_subplot(121, projection="3d")
-    #     unique_locs = list(set(filtered_locations))
-    #     color_map = {loc: plt.cm.viridis(i / len(unique_locs)) for i, loc in enumerate(unique_locs)}
-    #     gt_colors = [color_map[loc] for loc in filtered_locations]
-    #     ax1.scatter(
-    #         embeddings_3d[:, 0], embeddings_3d[:, 1], embeddings_3d[:, 2], c=gt_colors, alpha=0.7
-    #     )
-    #     ax1.set_title("Ground Truth Labels")
+            # Rotate x-axis labels and give more space to y-axis labels
+            plt.setp(ax.get_xticklabels(), rotation=45, ha='right', rotation_mode='anchor')
+            plt.setp(ax.get_yticklabels(), fontsize=8)
+            fig.subplots_adjust(left=0.2, bottom=0.2)
 
-    #     # Plot 2: K-Means Predictions
-    #     ax2 = fig.add_subplot(122, projection="3d")
-    #     ax2.scatter(
-    #         embeddings_3d[:, 0],
-    #         embeddings_3d[:, 1],
-    #         embeddings_3d[:, 2],
-    #         c=cluster_labels,
-    #         cmap="viridis",
-    #         alpha=0.7,
-    #     )
-    #     ax2.set_title(f"K-Means Clusters (ARI: {ari_score:.2f})")
+            # --- THE NEW, MORE ROBUST FIX IS HERE ---
+            # 1. Create an in-memory buffer
+            buf = io.BytesIO()
+            # 2. Save the figure to the buffer as a PNG
+            fig.savefig(buf, format='png', bbox_inches='tight')
+            # 3. Rewind the buffer's cursor to the beginning
+            buf.seek(0)
+            # 4. Read the PNG data from the buffer into a numpy array
+            image = imageio.imread(buf)
+            images.append(image)
+            plt.close(fig)
 
-    #     # Log the figure to Weights & Biases
-    #     self.logger.experiment.log({"validation_clusters": wandb.Image(fig)})
-    #     plt.close(fig)  # Close the figure to free memory
+        # Log the mean accuracy
+        svm_accuracy = np.mean(accuracies)
+        self.log("svm_accuracy", svm_accuracy, prog_bar=True)
+        print(f"svm_accuracy: {svm_accuracy:.4f}")
 
-    #     # --- 4. IMPORTANT: Clear the stored outputs ---
-    #     self.validation_step_outputs.clear()
+        # Define a path for the GIF
+        gif_path = "confusion_matrix_evolution.gif"
+
+        # Save the GIF to the path
+        imageio.mimsave(gif_path, images, fps=2, plugin='pillow')
+
+        # Log the GIF file to W&B as a video
+        self.logger.experiment.log({
+            "svm_confusion_matrix": wandb.Video(gif_path, fps=2, format="gif")
+        })
+
+        # Clean up the outputs list for the next epoch
+        self.validation_step_outputs.clear()
 
     def configure_optimizers(self):
         # Use the learning_rate from hparams so it can be configured by sweeps
@@ -395,23 +411,12 @@ class RadiographyEncoder(L.LightningModule):
         return optimizer
 
 
-@app.cell
-def _():
-    return
-
-
-@app.cell
-def _():
-    return
-
-
 @app.class_definition
 class PrismOrderingDataset(IterableDataset):
 
     def __init__(self, metadata, include_nifti, patch_shape, position_space, n_patches, n_aux_patches, n_sampled_from_same_study, scratch_dir):
         super().__init__()
-        self.metadata = pd.read_parquet('/gs/gsfs0/users/kaijones/datasets/rsna25_data/nifti_combined_metadata.parquet').dropna()
-
+        self.metadata = pd.read_parquet(metadata).dropna()
         self.patch_shape = patch_shape
         self.n_patches = n_patches
         self.n_sampled_from_same_study = n_sampled_from_same_study
@@ -678,11 +683,12 @@ class PrismOrderingDataset(IterableDataset):
 class ValidationDataset(IterableDataset):
     def __init__(self, prism_shape=(6, 64, 64), patch_shape=None, n_patches=None):
         super().__init__()
-        # NOTE: Make sure this path is correct on your system
+        metadata_df = pd.read_parquet('/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet')
+        aneurysm_df = pd.read_parquet("aneurysm_labels_with_nifti_coords.parquet")
 
-        self.metadata = pd.read_parquet('aneurysm_cleaned_6_64_64.parquet')
-        # Excluding a known problematic series
-        self.metadata = self.metadata[self.metadata['series_uid'] != '1.2.826.0.1.3680043.8.498.40511751565674479940947446050421785002']
+        aneurysm_subset = aneurysm_df[['SeriesInstanceUID', 'location', 'modality', 'image_position_delta_X', 'image_position_delta_Y', 'image_position_delta_Z', 'pixel_x', 'pixel_y', 'pixel_z']]
+        metadata_df = metadata_df.merge(aneurysm_subset, left_on='series_uid', right_on='SeriesInstanceUID', how='inner')
+        self.metadata = metadata_df.drop(columns=['modality_x'])
         self.prism_shape = prism_shape
         self.patch_shape = patch_shape
         self.n_patches = n_patches
@@ -691,34 +697,29 @@ class ValidationDataset(IterableDataset):
     def __iter__(self):
         # No need for worker splitting if num_workers=0, which is typical for smaller validation sets
         for _, row in self.metadata.iterrows():
-            try:
-                zarr_path = row["zarr_path"]
-                median = row["median"]
-                stdev = row["stdev"]
-                z, y, x = row['aneurysm_z'], row['aneurysm_y'], row['aneurysm_x']
-                location = row['location']
+            zarr_name = row["zarr_path"]
 
-                scan = zarr_scan(
-                    path_to_scan=zarr_path,
-                    median=median,
-                    stdev=stdev,
-                    patch_shape=self.patch_shape
-                )
+            # patch_shape = (1, patch_size, patch_size)
+            scan = zarr_scan(path_to_scan=zarr_name, median=row["median"], stdev=row["stdev"],  patch_shape=self.patch_shape)
+            for i in range(1):
+                sample = scan.train_sample(self.n_patches, subset_center=(row["pixel_x"], row["pixel_y"], row["pixel_z"]))
 
-                sample = scan.train_sample(
-                    n_patches=self.n_patches,
-                    subset_start=(z - self.prism_shape[0] / 2, y - self.prism_shape[1] / 2, x - self.prism_shape[2] / 2),
-                    subset_shape=self.prism_shape,
-                )
 
                 patches = torch.from_numpy(sample["normalized_patches"]).to(torch.float32)
                 patch_coords = torch.from_numpy(sample['patch_centers_pt'] - sample['subset_center_pt']).to(torch.float32)
 
                 # Yield data in the format expected by validation_step
-                yield patches, patch_coords, location
-            except Exception as e:
-                print(f"Skipping validation sample due to error: {e} in {row.get('zarr_path', 'N/A')}")
-                continue
+                yield patches, patch_coords, row["location"], zarr_name, row["modality_y"]
+
+            for i in range(1):
+                sample = scan.train_sample(self.n_patches)
+
+
+                patches = torch.from_numpy(sample["normalized_patches"]).to(torch.float32)
+                patch_coords = torch.from_numpy(sample['patch_centers_pt'] - sample['subset_center_pt']).to(torch.float32)
+
+                # Yield data in the format expected by validation_step
+                yield patches, patch_coords, "random", zarr_name, row["modality_y"]
 
 
 @app.cell
@@ -761,7 +762,7 @@ def _():
 
         print(run.config)
         print("======\n")
-        checkpoint_dir = f'/cbica/home/gangarav/checkpoints/{run.id}'
+        checkpoint_dir = f'../checkpoints/{run.id}'
 
         # Pull the final config from wandb. This includes sweep params and defaults.
         cfg = run.config
@@ -802,14 +803,18 @@ def _():
         PATCH_SHAPE = (1, 12, 12)
         N_PATCHES = 64
         NUM_WORKERS = int(get_allocated_cpus())-2
-        METADATA_PATH = '/gs/gsfs0/users/kaijones/datasets/rsna25_data/nifti_combined_metadata.parquet'
-        scratch_dir = os.environ.get('TMPDIR') + "/scans"
+        METADATA_PATH = '/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet'
 
-        if scratch_dir is None:
-            # If the variable isn't set, raise an error or use a default.
-            # For a cluster job, it's better to fail loudly.
-            raise ValueError("Environment variable TMP is not set. This is required for the scratch directory.")
-            # scratch_dir = "/scratch/gangarav/"
+        base_temp_dir = tempfile.gettempdir()
+
+        if not os.path.isdir(base_temp_dir) or not os.access(base_temp_dir, os.W_OK):
+            raise IOError(
+                f"The determined temporary directory '{base_temp_dir}' "
+                "is not a writable directory. Check system configuration and permissions."
+            )
+
+        scratch_dir = os.path.join(base_temp_dir, "scans")
+        os.makedirs(scratch_dir, exist_ok=True)
 
         dataset = PrismOrderingDataset(
             include_nifti=cfg.include_nifti,
@@ -821,6 +826,7 @@ def _():
             scratch_dir=scratch_dir,
             n_sampled_from_same_study=cfg.num_repeated_study_samples
         )
+
         dataloader = DataLoader(
             dataset,
             batch_size=int(cfg.batch_size * (get_gpu_memory_gb()[0]/100.0)),
@@ -829,28 +835,25 @@ def _():
             pin_memory=True,
         )
 
+        val_dataset = ValidationDataset(
+            patch_shape=PATCH_SHAPE,
+            n_patches=N_PATCHES
+        )
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=2*int(cfg.batch_size * (get_gpu_memory_gb()[0]/100.0)),
+            num_workers=2,
+            persistent_workers=True,
+            pin_memory=True,
+        )
 
-        # val_dataset = ValidationDataset(
-        #     patch_shape=PATCH_SHAPE,
-        #     n_patches=N_PATCHES
-        # )
-        # val_dataloader = DataLoader(
-        #     val_dataset,
-        #     batch_size=cfg.batch_size * 2, # Can often use a larger batch size for validation
-        #     num_workers=2,
-        #     persistent_workers=True,
-        #     pin_memory=True,
-        # )
-
-        # --- 5. Setup Callbacks and Logger ---
-        # The logger will automatically use the run initialized by wandb.init()
-        wandb_logger = WandbLogger(project="rsna25-prism-ordering", log_model=True)
+        wandb_logger = WandbLogger(log_model="all")
 
         # Checkpoints are saved in a directory named after the unique wandb run ID
         checkpoint_callback = ModelCheckpoint(
             dirpath=checkpoint_dir,
             filename='{step}',
-            every_n_train_steps=5000,
+            every_n_train_steps=100,
             save_last=True,
         )
 
@@ -862,8 +865,8 @@ def _():
             accumulate_grad_batches=int(80.0/get_gpu_memory_gb()[0]),
             logger=wandb_logger,
             log_every_n_steps=25,
-            #val_check_interval=5000,
-            #num_sanity_val_steps=0,
+            val_check_interval=5000,
+            num_sanity_val_steps=0,
         )
 
         # --- 7. Start Training ---
@@ -872,7 +875,7 @@ def _():
         trainer.fit(
             model=model,
             train_dataloaders=dataloader,
-            # val_dataloaders=val_dataloader,
+            val_dataloaders=val_dataloader,
             ckpt_path=ckpt_path
         )
 
@@ -881,70 +884,46 @@ def _():
 
 
 @app.cell
-def _():
-    # wandb_logger = WandbLogger(project="rsna25-prism-ordering")
-
-    # checkpoint_callback = ModelCheckpoint(
-    #     dirpath=f'checkpoints/{wandb_logger.version}', # Save in a run-specific folder
-    #     filename='best_model_all', # Always name the file 'best_model.ckpt'
-    #     save_top_k=1,          # Only save the single best checkpoint
-    #     monitor='view_loss',   # Metric to monitor
-    #     mode='min',            # 'min' because lower loss is better
-    #     every_n_train_steps=5000,
-    #     save_on_train_epoch_end=False
-    # )
-
-    # trainer = L.Trainer(limit_train_batches=100000, max_epochs=1000, callbacks=[checkpoint_callback], logger=wandb_logger, log_every_n_steps=25)
-    # trainer.fit(model=encoder, train_dataloaders=dataloader) #, val_dataloaders=) #
-    return
-
-
-@app.cell
 def _(train_run):
-    default_config = {
-        'encoder_dim': 288,
-        'encoder_depth': 12,
-        'encoder_heads': 12,
-        'mlp_dim': 512,
-        'n_registers': 8,
-        'batch_size': 128,
-        'learning_rate': 1e-4,
-        'pos_objective_mode': 'regression',
-        'position_space': 'patient',
-        'n_aux_patches': 4,
-        'window_objective': True,
-        'num_repeated_study_samples': 1,
-        'scan_contrastive_objective': True,
-        'mim_objective': False,
-    }
-
     def _make_sure_scratch_is_clean():
-        scratch_dir = os.environ.get('TMPDIR') + "/scans"
-        if scratch_dir and os.path.exists(scratch_dir):
-            total_size = 0
-            for root, dirs, files in os.walk(scratch_dir):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    total_size += os.path.getsize(fp)
-            print(f"Scratch directory size: {total_size / (1024**2):.2f} MB")
+        base_temp_dir = tempfile.gettempdir()
+        if not os.path.isdir(base_temp_dir) or not os.access(base_temp_dir, os.W_OK):
+            raise IOError(
+                f"The temporary directory '{base_temp_dir}' is not a writable directory."
+            )
+
+        scratch_dir = os.path.join(base_temp_dir, "scans")
+
+        if not os.path.exists(scratch_dir):
+            os.makedirs(scratch_dir)
+            print(f"Created clean scratch directory: {scratch_dir}")
+            return
+
+        print(f"Found existing scratch directory: {scratch_dir}")
+        total_size = sum(
+            os.path.getsize(os.path.join(root, f))
+            for root, _, files in os.walk(scratch_dir)
+            for f in files
+            if os.path.exists(os.path.join(root, f))
+        )
+        print(f"Scratch directory size: {total_size / (1024**2):.2f} MB")
+
+        entries = sorted(os.listdir(scratch_dir))
+        if entries:
             print("First few entries in scratch:")
-            for name in sorted(os.listdir(scratch_dir))[:5]:
+            for name in entries[:5]:
                 print("  ", name)
-            for name in os.listdir(scratch_dir):
-                path = os.path.join(scratch_dir, name)
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                else:
-                    os.remove(path)
-            print("Cleared scratch directory contents.")
+
+        try:
+            shutil.rmtree(scratch_dir)
+            os.makedirs(scratch_dir)
+            print("Successfully cleared and recreated scratch directory.")
+        except OSError as e:
+            print(f"Error clearing scratch directory: {e}")
+            raise
 
     _make_sure_scratch_is_clean()
-    train_run() #default_config=default_config)
-    return
-
-
-@app.cell
-def _():
+    train_run()
     return
 
 
