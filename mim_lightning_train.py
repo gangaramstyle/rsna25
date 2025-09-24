@@ -367,6 +367,7 @@ class RadiographyEncoder(L.LightningModule):
             # A convenience method to plot directly from predictions
 
             ConfusionMatrixDisplay.from_predictions(y_test, y_pred, ax=ax, normalize='true')
+            ax.images[0].set_clim(0, 1)
             ax.set_title(f'Test Size: {test_size:.1f}')
 
             # Rotate x-axis labels and give more space to y-axis labels
@@ -681,9 +682,9 @@ class PrismOrderingDataset(IterableDataset):
 
 @app.class_definition
 class ValidationDataset(IterableDataset):
-    def __init__(self, prism_shape=(6, 64, 64), patch_shape=None, n_patches=None):
+    def __init__(self, metadata, prism_shape=(6, 64, 64), patch_shape=None, n_patches=None):
         super().__init__()
-        metadata_df = pd.read_parquet('/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet')
+        metadata_df = pd.read_parquet(metadata)
         aneurysm_df = pd.read_parquet("aneurysm_labels_with_nifti_coords.parquet")
 
         aneurysm_subset = aneurysm_df[['SeriesInstanceUID', 'location', 'modality', 'image_position_delta_X', 'image_position_delta_Y', 'image_position_delta_Z', 'pixel_x', 'pixel_y', 'pixel_z']]
@@ -836,6 +837,7 @@ def _():
         )
 
         val_dataset = ValidationDataset(
+            metadata=METADATA_PATH,
             patch_shape=PATCH_SHAPE,
             n_patches=N_PATCHES
         )
@@ -853,7 +855,7 @@ def _():
         checkpoint_callback = ModelCheckpoint(
             dirpath=checkpoint_dir,
             filename='{step}',
-            every_n_train_steps=100,
+            every_n_train_steps=2000,
             save_last=True,
         )
 
