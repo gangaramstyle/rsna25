@@ -18,7 +18,7 @@ parameters:
   mlp_dim:
     values: [512, 768]
   batch_size:
-    values: [1024, 1536, 2048]
+    values: [1024]
   n_registers:
     values: [4, 8, 12]
   pos_objective_mode:
@@ -36,7 +36,7 @@ parameters:
   num_repeated_study_samples:
     values: [4, 8, 16, 32]
   use_rotary:
-    values: [true, false]
+    values: [true]
   use_absolute:
     values: [true]
   max_freq:

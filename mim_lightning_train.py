@@ -823,7 +823,7 @@ def _():
         PATCH_SHAPE = (1, 12, 12)
         N_PATCHES = 64
         NUM_WORKERS = int(get_allocated_cpus())-2
-        METADATA_PATH = '/cbica/home/gangarav/rsna_any/rsna_2025/nifti_combined_metadata.parquet'
+        METADATA_PATH = '/gs/gsfs0/users/kaijones/datasets/rsna25_data/nifti_combined_metadata.parquet'
 
         base_temp_dir = tempfile.gettempdir()
 
@@ -855,18 +855,17 @@ def _():
             pin_memory=True,
         )
 
-        val_dataset = ValidationDataset(
-            metadata=METADATA_PATH,
-            patch_shape=PATCH_SHAPE,
-            n_patches=N_PATCHES
-        )
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=2*int(cfg.batch_size * (get_gpu_memory_gb()[0]/100.0)),
-            num_workers=2,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+        #val_dataset = ValidationDataset(
+        #    patch_shape=PATCH_SHAPE,
+        #    n_patches=N_PATCHES
+        #)
+        #val_dataloader = DataLoader(
+        #    val_dataset,
+        #    batch_size=2*int(cfg.batch_size * (get_gpu_memory_gb()[0]/100.0)),
+        #    num_workers=2,
+        #    persistent_workers=True,
+        #    pin_memory=True,
+        #)
 
         wandb_logger = WandbLogger(log_model="all")
 
@@ -886,7 +885,7 @@ def _():
             accumulate_grad_batches=int(80.0/get_gpu_memory_gb()[0]),
             logger=wandb_logger,
             log_every_n_steps=25,
-            val_check_interval=5000,
+            #val_check_interval=5000,
             num_sanity_val_steps=0,
         )
 
@@ -896,7 +895,7 @@ def _():
         trainer.fit(
             model=model,
             train_dataloaders=dataloader,
-            val_dataloaders=val_dataloader,
+            #val_dataloaders=val_dataloader,
             ckpt_path=ckpt_path
         )
 

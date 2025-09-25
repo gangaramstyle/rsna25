@@ -29,7 +29,7 @@ echo "---"
 echo "Starting W&B sweep agent..."
 cd /cbica/home/gangarav/rsna25
 
-uv run wandb agent vineeth-gangaram-penn/rsna25/61z09o6e
+uv run wandb agent vineeth-gangaram-penn/rsna25/098g46uq 
 echo "========================================================"
 echo "Agent job finished at: $(date)"
 echo "========================================================"
