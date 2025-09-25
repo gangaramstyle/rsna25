@@ -8,6 +8,7 @@ with app.setup:
     import wandb
     import sys
     import os
+    import glob
     import shutil
     import torch
     from torch import optim, nn, utils, Tensor
@@ -756,29 +757,47 @@ def _():
         Handles both starting new runs and resuming existing ones.
         """
         # --- 1. Initialize Weights & Biases ---
-        # `wandb.init()` will automatically pick up hyperparameters from a sweep agent.
-        # If resuming, it will use the WANDB_RUN_ID environment variable.
-        # The `resume="allow"` option is key to enabling this behavior.
         run = wandb.init(resume="allow")
 
-        print(run.config)
-        print("======\n")
+        print(f"Run config:\n{run.config}")
+        print("="*20)
+
+        # We will still use a local checkpoint directory for new checkpoints
         checkpoint_dir = f'../checkpoints/{run.id}'
 
-        # Pull the final config from wandb. This includes sweep params and defaults.
+        # Pull the final config from wandb.
         cfg = run.config
 
-        # --- 2. Handle Resuming ---
+        # --- 2. Handle Resuming from Wandb Artifacts ---
         ckpt_path = None
         if run.resumed:
-            print(f"Resuming run {run.id}...")
-            # Check for the 'last.ckpt' created by lightning's ModelCheckpoint.
-            potential_ckpt = os.path.join(checkpoint_dir, 'last.ckpt')
-            if os.path.exists(potential_ckpt):
-                ckpt_path = potential_ckpt
-                print(f"Found checkpoint to resume from: {ckpt_path}")
-            else:
-                print(f"WARNING: Run {run.id} is being resumed, but no 'last.ckpt' found in {checkpoint_dir}. Starting training from scratch but logging to the same run.")
+            print(f"Resuming run '{run.id}' from a wandb artifact...")
+            try:
+                # Construct the reference to the latest artifact for this run.
+                # The WandbLogger by default names the artifact 'model-<run.id>'
+                artifact_ref = f"{run.entity}/{run.project}/model-{run.id}:latest"
+                print(f"Attempting to download artifact: {artifact_ref}")
+
+                # Use the artifact and download its contents
+                artifact = run.use_artifact(artifact_ref, type='model')
+                artifact_dir = artifact.download()
+            
+                # The artifact directory contains the checkpoint file. We need to find it.
+                # It's often named 'model.ckpt' or something similar. Using glob is robust.
+                # The 'last.ckpt' symlink is not part of the artifact, so we look for the actual file.
+                ckpt_files = glob.glob(f"{artifact_dir}/*.ckpt")
+            
+                if ckpt_files:
+                    ckpt_path = ckpt_files[0]  # Get the first match
+                    print(f"Successfully found and downloaded checkpoint: {ckpt_path}")
+                else:
+                    print(f"WARNING: Artifact was downloaded, but no '*.ckpt' file was found in '{artifact_dir}'. Starting from scratch.")
+
+            except wandb.errors.CommError:
+                # This error occurs if the artifact doesn't exist (e.g., run was started
+                # but no checkpoint was saved yet).
+                print(f"WARNING: Could not find a 'model-{run.id}:latest' artifact. "
+                      "The run will start from scratch but log to the same wandb run.")
 
         # --- 3. Setup Model ---
         model = RadiographyEncoder(
